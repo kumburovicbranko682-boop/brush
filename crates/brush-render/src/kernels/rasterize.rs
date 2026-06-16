@@ -15,11 +15,12 @@ use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
+use super::camera_model::CameraModel;
 use super::helpers::{
-    ALPHA_CUTOFF_MID, PROJECTED_LANES, PROJECTED_LANES_USIZE, TILE_SIZE, TILE_WIDTH,
-    alpha_cutoff_weight, calc_sigma, map_1d_to_2d,
+    ALPHA_CUTOFF_MID, PROJECTED_GEO_LANES, PROJECTED_LANES, PROJECTED_LANES_USIZE, TILE_SIZE,
+    TILE_WIDTH, alpha_cutoff_weight, calc_sigma, dist_ndc, is_finite_f32, map_1d_to_2d, pixel_ray,
 };
-use super::types::{RasterizeUniforms, Sym2};
+use super::types::{RasterizeUniforms, Sym2, Sym3, Vec3A};
 
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
@@ -27,6 +28,7 @@ pub fn rasterize_kernel(
     compact_gid_from_isect: &Tensor<u32>,
     tile_offsets: &mut Tensor<u32>,
     projected: &Tensor<f32>,
+    projected_geo: &Tensor<f32>,
     out_img_packed: &mut Tensor<u32>,
     out_img_f32: &mut Tensor<f32>,
     global_from_compact_gid: &Tensor<u32>,
@@ -34,6 +36,8 @@ pub fn rasterize_kernel(
     u: RasterizeUniforms,
     #[comptime] bwd_info: bool,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] geo: bool,
+    #[comptime] camera_model: CameraModel,
 ) {
     let global_id = ABSOLUTE_POS as u32;
     let (pix_x, pix_y) = map_1d_to_2d(global_id, u.tile_bw);
@@ -75,6 +79,22 @@ pub fn rasterize_kernel(
     let mut pix_r = 0.0f32;
     let mut pix_g = 0.0f32;
     let mut pix_b = 0.0f32;
+    // GOF geometry accumulators: alpha-blended view-space surface normal + the
+    // GOF median depth (the ray-Gaussian intersection z at the T=0.5 crossing).
+    let mut pix_nx = 0.0f32;
+    let mut pix_ny = 0.0f32;
+    let mut pix_nz = 0.0f32;
+    let mut pix_depth = 0.0f32;
+    // Depth-distortion (GOF): squared pairwise error `Sum_{i>j} w_i w_j
+    // (m_i - m_j)^2` over NDC-mapped depths `m = far(t-near)/((far-near)t)`,
+    // accumulated front-to-back via the prefix moments `S1 = Sum(w*m)`,
+    // `S2 = Sum(w*m^2)` (error_i = m_i^2*A_<i + S2_<i - 2*m_i*S1_<i), and
+    // normalized by the final accumulated alpha squared at write-out.
+    // Matches GOF's renderCUDA; the squared form is sign-correct regardless
+    // of how per-pixel intersection depths order against the blend order.
+    let mut pix_dist = 0.0f32;
+    let mut pix_dist_s1 = 0.0f32;
+    let mut pix_dist_s2 = 0.0f32;
     let mut done = !inside;
     let mut last_useful_isect = range_lo;
 
@@ -145,6 +165,69 @@ pub fn rasterize_kernel(
                     pix_r += max(local_batch[dst_base + 6], 0.0f32) * vis;
                     pix_g += max(local_batch[dst_base + 7], 0.0f32) * vis;
                     pix_b += max(local_batch[dst_base + 8], 0.0f32) * vis;
+                    if comptime![geo] {
+                        // Read M + Mmu from global (not staged in shared; the 9
+                        // lanes would push workgroup shared past wgpu's 16 KiB
+                        // default limit). `projected_geo` is L1-cached.
+                        let gid_t = compact_gid_from_isect[(batch_start + t) as usize];
+                        let geo_base = (gid_t * PROJECTED_GEO_LANES) as usize;
+                        let m_sym = Sym3 {
+                            c00: projected_geo[geo_base],
+                            c01: projected_geo[geo_base + 1],
+                            c02: projected_geo[geo_base + 2],
+                            c11: projected_geo[geo_base + 3],
+                            c12: projected_geo[geo_base + 4],
+                            c22: projected_geo[geo_base + 5],
+                        };
+                        let mmu = Vec3A::new(
+                            projected_geo[geo_base + 6],
+                            projected_geo[geo_base + 7],
+                            projected_geo[geo_base + 8],
+                        );
+                        // GOF exact ray-Gaussian intersection. rp is the z=1
+                        // camera ray through this pixel; t* minimizes the quadric
+                        // along it: t* = (rp·Mμ)/(rpᵀ M rp). normal = -norm(M·rp).
+                        // The ray is undistorted in-kernel through the lens model
+                        // so the depth/normal are distortion-correct.
+                        let rp = pixel_ray(
+                            pixel_coord_x,
+                            pixel_coord_y,
+                            u.pinhole.cx,
+                            u.pinhole.cy,
+                            u.pinhole.fx,
+                            u.pinhole.fy,
+                            camera_model,
+                        );
+                        let mrp = m_sym.mul_vec3(rp);
+                        let denom = rp.dot(mrp);
+                        let geo_ok = is_finite_f32(denom) && denom > 1e-12f32;
+                        if geo_ok {
+                            // GOF form: t* = -BB/(2 AA), the quadric minimum
+                            // along the ray. AA = rpᵀ M rp; BB = -2 (rp·Mμ).
+                            let aa = denom;
+                            let bb = rp.dot(mmu) * -2.0f32;
+                            let t_pix = -bb / (2.0f32 * aa);
+                            let normal = mrp.normalize().scale(-1.0f32);
+                            // Distortion increment: prefix weight `1 - t_acc` and
+                            // prefix moments, all *before* this splat updates them.
+                            let m = dist_ndc(t_pix);
+                            let w_prev = 1.0f32 - t_acc;
+                            pix_dist +=
+                                vis * (m * m * w_prev + pix_dist_s2 - 2.0f32 * m * pix_dist_s1);
+                            pix_dist_s1 += m * vis;
+                            pix_dist_s2 += m * m * vis;
+                            // GOF median depth: the surface is where front-to-back
+                            // transmittance crosses 0.5. `t_acc` is the pre-splat
+                            // transmittance, so the last splat written while it is
+                            // still > 0.5 is the median. Not alpha-blended.
+                            if t_acc > 0.5f32 {
+                                pix_depth = t_pix;
+                            }
+                            pix_nx += normal.x() * vis;
+                            pix_ny += normal.y() * vis;
+                            pix_nz += normal.z() * vis;
+                        }
+                    }
                     t_acc = next_t;
                     last_useful_isect = batch_start + t + 1u32;
                 }
@@ -163,11 +246,25 @@ pub fn rasterize_kernel(
         let final_b = pix_b + t_acc * u.bg_b;
         let final_a = 1.0f32 - t_acc;
         if comptime![bwd_info] {
-            let base = (pix_id * 4u32) as usize;
+            let nchan = comptime![if geo { 11u32 } else { 4u32 }];
+            let base = (pix_id * nchan) as usize;
             out_img_f32[base] = final_r;
             out_img_f32[base + 1] = final_g;
             out_img_f32[base + 2] = final_b;
             out_img_f32[base + 3] = final_a;
+            if comptime![geo] {
+                // Geometry has no background; leftover transmittance contributes 0.
+                out_img_f32[base + 4] = pix_nx;
+                out_img_f32[base + 5] = pix_ny;
+                out_img_f32[base + 6] = pix_nz;
+                out_img_f32[base + 7] = pix_depth;
+                // Normalized distortion (GOF: raw / (1-T)^2), then the raw
+                // mapped-depth moments S1/S2 the backward needs to
+                // reconstruct per-splat pairwise sums.
+                out_img_f32[base + 8] = pix_dist / (final_a * final_a + 1e-7f32);
+                out_img_f32[base + 9] = pix_dist_s1;
+                out_img_f32[base + 10] = pix_dist_s2;
+            }
         } else {
             let r = clamp(final_r * 255.0f32, 0.0f32, 255.0f32) as u32;
             let g = clamp(final_g * 255.0f32, 0.0f32, 255.0f32) as u32;

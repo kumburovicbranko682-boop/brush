@@ -7,12 +7,36 @@ use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
-use super::types::{PixelRect, ProjectUniforms, Quat, Splat, Sym2, TileBbox, Vec3A};
-use crate::kernels::camera_model::{CameraModel, calculate_project_jacobian};
+use super::types::{Mat3, PixelRect, ProjectUniforms, Quat, Splat, Sym2, Sym3, TileBbox, Vec3A};
+use crate::kernels::camera_model::{CameraModel, calculate_project_jacobian, unproject_ray};
 pub use brush_cube::{calc_sigma, is_finite_f32, sigmoid};
 
 pub const TILE_WIDTH: u32 = 16;
 pub const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH;
+
+/// NDC depth-mapping planes for the distortion loss, `m = far(t - near) /
+/// ((far - near) t)`. Matches GOF's `NEAR_PLANE` / `FAR_PLANE` so the mapped
+/// depth lands in `[0, 1]` and the distortion weight transfers across scenes.
+pub const DIST_NEAR: f32 = 0.2;
+pub const DIST_FAR: f32 = 100.0;
+
+/// NDC-map a depth for the distortion loss (clamped to `t >= DIST_NEAR`).
+#[cube]
+pub fn dist_ndc(t: f32) -> f32 {
+    let t_m = max(t, DIST_NEAR);
+    (DIST_FAR * t_m - DIST_FAR * DIST_NEAR) / ((DIST_FAR - DIST_NEAR) * t_m)
+}
+
+/// `d(dist_ndc)/dt`; zero in the clamped region.
+#[cube]
+pub fn dist_ndc_deriv(t: f32) -> f32 {
+    let t_m = max(t, DIST_NEAR);
+    select(
+        t > DIST_NEAR,
+        DIST_FAR * DIST_NEAR / ((DIST_FAR - DIST_NEAR) * t_m * t_m),
+        0.0f32,
+    )
+}
 
 /// Smoothstep ramp centered at 1/255: zero below `MID - BAND/2`, one
 /// above `MID + BAND/2`. C^1 in alpha. Selected at kernel-compile-time
@@ -50,6 +74,15 @@ pub fn alpha_cutoff_weight_deriv(alpha: f32) -> f32 {
 ///   6:color_r, 7:color_g, 8:color_b.
 pub const PROJECTED_LANES: u32 = 9;
 pub const PROJECTED_LANES_USIZE: usize = PROJECTED_LANES as usize;
+
+/// `f32` lanes per projected splat in the *geometry* side-buffer. Layout:
+/// 0:m00, 1:m01, 2:m02, 3:m11, 4:m12, 5:m22 (six unique entries of the
+/// camera-space inverse covariance `M = Σ_c⁻¹`), then 6:mmu_x, 7:mmu_y, 8:mmu_z
+/// (`M·mean_c`). The per-pixel GOF depth `t* = (rp·Mμ)/(rpᵀ M rp)` and normal
+/// `-normalize(M·rp)` are computed in the rasterizer from these. Only
+/// written/read when geometry is requested; the color pipeline is untouched.
+pub const PROJECTED_GEO_LANES: u32 = 9;
+pub const PROJECTED_GEO_LANES_USIZE: usize = PROJECTED_GEO_LANES as usize;
 
 #[cube]
 pub fn compact_bits_16(v: u32) -> u32 {
@@ -338,4 +371,77 @@ pub fn read_quat_unorm(transforms: &Tensor<f32>, base: usize) -> Quat {
         transforms[base + 5],
         transforms[base + 6],
     )
+}
+
+/// z=1 camera ray through a pixel, undistorted by the lens model. The forward
+/// and backward rasterizers MUST share this so their per-pixel GOF intersection
+/// (and thus the VJP) stays byte-identical.
+#[cube]
+pub fn pixel_ray(
+    px: f32,
+    py: f32,
+    cx: f32,
+    cy: f32,
+    fx: f32,
+    fy: f32,
+    #[comptime] camera_model: CameraModel,
+) -> Vec3A {
+    let d_x = (px - cx) / fx;
+    let d_y = (py - cy) / fy;
+    unproject_ray(d_x, d_y, camera_model)
+}
+
+/// Per-Gaussian GOF intersection geometry (camera space).
+///
+/// Returns `(M, Mμ)` where `M = Σ_c⁻¹ = R_c diag(1/s²) R_cᵀ` (R_c =
+/// view_rot·R(quat)) is the camera-space inverse covariance and `Mμ = M·mean_c`.
+/// The rasterizer reconstructs the GOF exact ray-Gaussian intersection depth
+/// `t* = (rp·Mμ)/(rpᵀ M rp)` (camera-space z) and the surface normal
+/// `-normalize(M·rp)` per pixel from these. `quat` must already be normalized.
+#[cube]
+pub fn splat_view_gof(scale: Vec3A, quat: Quat, mean_c: Vec3A, view_rot: Mat3) -> (Sym3, Vec3A) {
+    // Camera-space inverse covariance Σ_c⁻¹ = R_c diag(1/s²) R_cᵀ, with
+    // R_c = view_rot·R(quat). Built as M Mᵀ for M = R_c diag(1/s).
+    let r_c = view_rot.mul_mat3(quat.to_mat3());
+    // Floor `1/s` at 1e6 (i.e. s >= 1e-6). A tighter floor (1e-9) lets a
+    // collapsed axis push `1/s²` toward f32 overflow, flipping the splat
+    // between a valid intersection and the degenerate fallback.
+    let inv_s = Vec3A::new(
+        f32::min(1.0f32 / scale.x(), 1e6f32),
+        f32::min(1.0f32 / scale.y(), 1e6f32),
+        f32::min(1.0f32 / scale.z(), 1e6f32),
+    );
+    let cov_cam_inv = r_c.mul_diag(inv_s).outer_product_self();
+    let mmu = cov_cam_inv.mul_vec3(mean_c);
+    (cov_cam_inv, mmu)
+}
+
+#[cube]
+pub fn read_projected_geo(geo: &Tensor<f32>, idx: u32) -> (Sym3, Vec3A) {
+    let b = (idx * PROJECTED_GEO_LANES) as usize;
+    (
+        Sym3 {
+            c00: geo[b],
+            c01: geo[b + 1],
+            c02: geo[b + 2],
+            c11: geo[b + 3],
+            c12: geo[b + 4],
+            c22: geo[b + 5],
+        },
+        Vec3A::new(geo[b + 6], geo[b + 7], geo[b + 8]),
+    )
+}
+
+#[cube]
+pub fn write_projected_geo(geo: &mut Tensor<f32>, idx: u32, m: Sym3, mmu: Vec3A) {
+    let b = (idx * PROJECTED_GEO_LANES) as usize;
+    geo[b] = m.c00;
+    geo[b + 1] = m.c01;
+    geo[b + 2] = m.c02;
+    geo[b + 3] = m.c11;
+    geo[b + 4] = m.c12;
+    geo[b + 5] = m.c22;
+    geo[b + 6] = mmu.x();
+    geo[b + 7] = mmu.y();
+    geo[b + 8] = mmu.z();
 }

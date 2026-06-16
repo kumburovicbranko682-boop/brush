@@ -6,7 +6,6 @@ use burn::{
     prelude::Module,
     tensor::{Device, Int, Tensor, TensorData, s},
 };
-use glam::Vec3;
 
 /// Decimate splats to `target_count` using pre-computed per-Gaussian scores.
 /// Higher scores are considered more important and kept.
@@ -98,7 +97,14 @@ pub async fn compute_pup_scores(
         let mut splats: Splats = splats.clone().train();
         splats.transforms = splats.transforms.map(|t: Tensor<2>| t.require_grad());
 
-        let diff_out = render_splats(splats.clone(), &view.camera, img_size, Vec3::ZERO).await;
+        let diff_out = render_splats(
+            splats.clone(),
+            &view.camera,
+            img_size,
+            brush_render::gaussian_splats::RenderOptions::float(),
+            None,
+        )
+        .await;
         let pred_rgb = diff_out.img.slice(s![.., .., 0..3]);
 
         let gt_packed: Tensor<2, Int> = Tensor::from_data(gt_data, device);

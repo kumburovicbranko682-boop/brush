@@ -3,7 +3,7 @@ use crate::{
     RenderAuxInner, SplatOps,
     camera::Camera,
     dim_check::DimCheck,
-    gaussian_splats::{RasterPass, SplatRenderMode},
+    gaussian_splats::{RenderOptions, SplatRenderMode},
     get_tile_offset::{CHECKS_PER_ITER, get_tile_offsets},
     kernels,
     render_aux::RenderOutput,
@@ -22,7 +22,7 @@ use burn::tensor::{DType, FloatDType, IntDType};
 use burn_cubecl::cubecl::CubeDim;
 use burn_cubecl::kernel::into_contiguous;
 use burn_wgpu::WgpuRuntime;
-use glam::{Vec3, uvec2};
+use glam::uvec2;
 use kernels::types::RasterizeUniformsLaunch;
 use std::f32::consts::PI;
 
@@ -42,16 +42,18 @@ impl SplatOps for MainBackendBase {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
-        render_mode: SplatRenderMode,
-        background: Vec3,
-        pass: RasterPass,
+        options: RenderOptions,
     ) -> RenderOutput<Self> {
+        // The splat-scale slider is consumed by the `Splats`-level wrappers (it
+        // adjusts the log scales before the tensors reach this raw-tensor op).
         assert!(
             img_size[0] > 0 && img_size[1] > 0,
             "Can't render images with 0 size."
         );
-        let bwd_info = pass.bwd_info();
-        let smooth_cutoff = pass.smooth_cutoff();
+        let bwd_info = options.pass.bwd_info();
+        let smooth_cutoff = options.pass.smooth_cutoff();
+        // Geometry (GOF normal + median depth) only rides the f32/backward path.
+        let geo = options.geometry && bwd_info;
 
         let transforms = into_contiguous(transforms);
         let sh_coeffs = into_contiguous(sh_coeffs);
@@ -64,7 +66,7 @@ impl SplatOps for MainBackendBase {
 
         let total_splats = transforms.shape()[0] as u32;
         let sh_degree = sh_degree_from_coeffs(sh_coeffs.shape()[1] as u32);
-        let mip_splat = matches!(render_mode, SplatRenderMode::Mip);
+        let mip_splat = matches!(options.render_mode, SplatRenderMode::Mip);
 
         let half_max_render_fov =
             ((camera.fov_x as f32).hypot(camera.fov_y as f32) * 1.05).min(2.0 * PI - 1e-6) * 0.5;
@@ -168,7 +170,7 @@ impl SplatOps for MainBackendBase {
 
         project_uniforms.num_visible = num_visible;
 
-        let mip_splat = matches!(render_mode, SplatRenderMode::Mip);
+        let mip_splat = matches!(options.render_mode, SplatRenderMode::Mip);
         let img_size: glam::UVec2 = project_uniforms.img_size.into();
         let tile_bounds: glam::UVec2 = project_uniforms.tile_bounds.into();
         let num_visible_sz = (num_visible as usize).max(1);
@@ -189,6 +191,14 @@ impl SplatOps for MainBackendBase {
             &device,
             DType::F32,
         );
+        let projected_geo = create_tensor(
+            [
+                if geo { num_visible_sz } else { 1 },
+                kernels::helpers::PROJECTED_GEO_LANES_USIZE,
+            ],
+            &device,
+            DType::F32,
+        );
         tracing::trace_span!("ProjectVisible").in_scope(|| {
             let uniforms = project_uniforms.to_launch_object();
             kernels::project_visible::project_visible_kernel::launch::<WgpuRuntime>(
@@ -200,10 +210,12 @@ impl SplatOps for MainBackendBase {
                 raw_opacities.into_tensor_arg(),
                 global_from_compact_gid.clone().into_tensor_arg(),
                 projected_splats.clone().into_tensor_arg(),
+                projected_geo.clone().into_tensor_arg(),
                 uniforms,
                 mip_splat,
                 sh_degree,
                 camera.camera_model,
+                geo,
             );
         });
         let num_tiles = tile_bounds.x * tile_bounds.y;
@@ -244,7 +256,13 @@ impl SplatOps for MainBackendBase {
                 tile_offsets.clone().into_tensor_arg(),
             );
         });
-        let out_dim = if bwd_info { 4 } else { 1 };
+        let out_dim = if geo {
+            crate::geo::GEO_CHANNELS
+        } else if bwd_info {
+            4
+        } else {
+            1
+        };
         let out_img = create_tensor(
             [img_size.y as usize, img_size.x as usize, out_dim],
             &device,
@@ -269,9 +287,10 @@ impl SplatOps for MainBackendBase {
                 project_uniforms.tile_bounds[0],
                 project_uniforms.img_size[0],
                 project_uniforms.img_size[1],
-                background.x,
-                background.y,
-                background.z,
+                options.background.x,
+                options.background.y,
+                options.background.z,
+                project_uniforms.pinhole_params.to_launch_object(),
             );
             kernels::rasterize::rasterize_kernel::launch::<WgpuRuntime>(
                 &client,
@@ -283,6 +302,7 @@ impl SplatOps for MainBackendBase {
                 compact_gid_from_isect.clone().into_tensor_arg(),
                 tile_offsets.clone().into_tensor_arg(),
                 projected_splats.clone().into_tensor_arg(),
+                projected_geo.clone().into_tensor_arg(),
                 out_packed_arg.into_tensor_arg(),
                 out_f32_arg.into_tensor_arg(),
                 global_from_compact_gid.clone().into_tensor_arg(),
@@ -290,6 +310,8 @@ impl SplatOps for MainBackendBase {
                 uniforms,
                 bwd_info,
                 smooth_cutoff,
+                geo,
+                camera.camera_model,
             );
         });
         RenderOutput {
@@ -303,6 +325,7 @@ impl SplatOps for MainBackendBase {
                 img_size,
             },
             projected_splats,
+            projected_geo,
             compact_gid_from_isect,
             project_uniforms,
             global_from_compact_gid,

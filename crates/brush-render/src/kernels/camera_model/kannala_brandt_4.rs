@@ -15,6 +15,40 @@ pub struct KannalaBrandt4Params {
     pub k4: f32,
 }
 
+/// Undistorted z=1 ray from pinhole-normalized distorted coords `(dx, dy)`.
+/// `r_d = hypot(d)` is the projected (distorted) radius. Newton-solve
+/// `kb4_d(theta) = r_d`, then `scale = tan(theta)/r_d`.
+#[cube]
+pub fn unproject_ray_kb4(dx: f32, dy: f32, #[comptime] params: KannalaBrandt4Params) -> Vec3A {
+    let KannalaBrandt4Params { k1, k2, k3, k4 } = params;
+
+    let r_d = f32::sqrt(dx * dx + dy * dy);
+    let mut scale = 1.0f32;
+    if r_d >= 1e-12f32 {
+        let mut theta = r_d;
+        let mut iter = 0u32;
+        while iter < 20u32 {
+            let t2 = theta * theta;
+            let t3 = t2 * theta;
+            let t4 = t2 * t2;
+            let t5 = t3 * t2;
+            let t6 = t4 * t2;
+            let t7 = t5 * t2;
+            let t8 = t4 * t4;
+            let t9 = t7 * t2;
+            let f = theta + k1 * t3 + k2 * t5 + k3 * t7 + k4 * t9 - r_d;
+            let fp =
+                1.0f32 + 3.0f32 * k1 * t2 + 5.0f32 * k2 * t4 + 7.0f32 * k3 * t6 + 9.0f32 * k4 * t8;
+            // Compound assign: a plain `theta = theta - f/fp` can fail to update
+            // the outer var inside a `#[cube]` loop.
+            theta += -(f / fp);
+            iter += 1u32;
+        }
+        scale += (f32::tan(theta) / r_d) - 1.0f32;
+    }
+    Vec3A::new(dx * scale, dy * scale, 1.0f32)
+}
+
 #[cube]
 pub fn project_kb4(
     point: Vec3A,

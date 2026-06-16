@@ -29,6 +29,12 @@ pub fn project_pinhole(point: Vec3A, params: PinholeParams) -> (f32, f32) {
     (u, v)
 }
 
+/// Undistorted z=1 ray from pinhole-normalized distorted coords. Identity.
+#[cube]
+pub fn unproject_ray_pinhole(dx: f32, dy: f32) -> Vec3A {
+    Vec3A::new(dx, dy, 1.0f32)
+}
+
 #[cube]
 pub fn calculate_project_jacobian_pinhole(
     point: Vec3A,

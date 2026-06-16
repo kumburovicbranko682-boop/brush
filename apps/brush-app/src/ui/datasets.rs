@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use brush_dataset::{
     Dataset,
+    load_depth::DepthData,
     scene::{LoadImage, Scene, SceneView, ViewType},
 };
 use brush_process::message::{ProcessMessage, TrainMessage};
@@ -33,16 +34,24 @@ fn selected_scene(t: ViewType, dataset: &Dataset) -> &Scene {
     }
 }
 
+/// A loaded view preview: the RGB texture plus, when the view carries a depth
+/// sidecar, its colormapped depth texture. The panel picks which to display.
+#[derive(Clone)]
+struct Preview {
+    tex: TexHandle,
+    depth: Option<egui::TextureHandle>,
+}
+
 enum LoadState {
-    Pending(oneshot::Receiver<TexHandle>),
-    Ready(TexHandle),
+    Pending(oneshot::Receiver<Preview>),
+    Ready(Preview),
 }
 
 struct PreviewJob {
     view: SceneView,
     ctx: egui::Context,
     preview_edge: u32,
-    reply: oneshot::Sender<TexHandle>,
+    reply: oneshot::Sender<Preview>,
 }
 
 struct PreviewLoader {
@@ -63,10 +72,10 @@ impl PreviewLoader {
                 actor
                     .run(move || async move {
                         while let Ok(job) = rx.recv().await {
-                            if let Some(tex) =
+                            if let Some(preview) =
                                 load_preview(job.view, job.ctx.clone(), job.preview_edge).await
                             {
-                                let _ = job.reply.send(tex);
+                                let _ = job.reply.send(preview);
                                 job.ctx.request_repaint();
                             }
                         }
@@ -91,23 +100,23 @@ impl PreviewLoader {
         }
     }
 
-    /// Get a ready texture for `view`, queuing a decode on a miss. Returns
-    /// `Some` only once the texture is uploaded.
-    fn request(&mut self, view: &SceneView, ctx: &egui::Context) -> Option<TexHandle> {
-        if let Some(tex) = self.cache_get(&view.image) {
-            return Some(tex);
+    /// Get a ready preview for `view`, queuing a decode on a miss. Returns
+    /// `Some` only once the textures are uploaded.
+    fn request(&mut self, view: &SceneView, ctx: &egui::Context) -> Option<Preview> {
+        if let Some(preview) = self.cache_get(&view.image) {
+            return Some(preview);
         }
         self.spawn_load(view, ctx);
         None
     }
 
-    /// Look up a target in the cache. Returns `Some(tex)` when ready.
-    fn cache_get(&mut self, target: &LoadImage) -> Option<TexHandle> {
+    /// Look up a target in the cache. Returns `Some(preview)` when ready.
+    fn cache_get(&mut self, target: &LoadImage) -> Option<Preview> {
         let pos = self.cache.iter().position(|(img, _)| img == target)?;
 
         if let LoadState::Pending(rx) = &mut self.cache[pos].1 {
             match rx.try_recv() {
-                Ok(tex) => self.cache[pos].1 = LoadState::Ready(tex),
+                Ok(preview) => self.cache[pos].1 = LoadState::Ready(preview),
                 Err(oneshot::error::TryRecvError::Empty) => return None,
                 Err(oneshot::error::TryRecvError::Closed) => {
                     // Load failed (sender dropped without sending). Drop the slot
@@ -117,13 +126,13 @@ impl PreviewLoader {
                 }
             }
         }
-        let LoadState::Ready(tex) = &self.cache[pos].1 else {
+        let LoadState::Ready(preview) = &self.cache[pos].1 else {
             unreachable!()
         };
-        let tex = tex.clone();
+        let preview = preview.clone();
         let entry = self.cache.remove(pos)?;
         self.cache.push_front(entry);
-        Some(tex)
+        Some(preview)
     }
 
     /// Queue a load on the shared pool.
@@ -146,6 +155,45 @@ impl PreviewLoader {
     }
 }
 
+/// Map conf==2 finite depths to magma, per-frame normalized. conf!=2 / no-return
+/// pixels become transparent so the panel checkerboard shows through. Same magma
+/// ramp the viewer uses, so depth reads the same everywhere.
+fn depth_to_rgba(d: &DepthData) -> egui::ColorImage {
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for i in 0..d.depth.len() {
+        if d.conf.get(i).copied() == Some(2) && d.depth[i].is_finite() {
+            lo = lo.min(d.depth[i]);
+            hi = hi.max(d.depth[i]);
+        }
+    }
+    // Degenerate / empty range: avoid div-by-zero, render a flat midpoint.
+    let span = if hi > lo { hi - lo } else { 1.0 };
+
+    let mut pixels = vec![Color32::TRANSPARENT; d.width * d.height];
+    for i in 0..pixels.len() {
+        let valid =
+            d.conf.get(i).copied() == Some(2) && d.depth.get(i).is_some_and(|v| v.is_finite());
+        if valid {
+            let t = ((d.depth[i] - lo) / span).clamp(0.0, 1.0);
+            let [r, g, b] = magma(t);
+            pixels[i] = Color32::from_rgb(r, g, b);
+        }
+    }
+    egui::ColorImage::new([d.width, d.height], pixels)
+}
+
+/// Magma colormap approximation for t in [0,1] (matches the viewer ramp).
+fn magma(t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let r = (-0.002136 + t * (0.2516 + t * (8.353 + t * (-27.66 + t * (28.32 + t * -8.40)))))
+        .clamp(0.0, 1.0);
+    let g = (0.000949 + t * (0.6739 + t * (-3.276 + t * (10.31 + t * (-12.07 + t * 4.864)))))
+        .clamp(0.0, 1.0);
+    let b = (-0.005774 + t * (2.494 + t * (-9.621 + t * (21.27 + t * (-23.05 + t * 9.110)))))
+        .clamp(0.0, 1.0);
+    [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
+}
+
 pub struct DatasetPanel {
     view_type: ViewType,
     cur_dataset: Dataset,
@@ -153,8 +201,9 @@ pub struct DatasetPanel {
     current_view_index: Option<usize>,
     loading_start: Option<web_time::Instant>,
     loader: PreviewLoader,
+    show_depth: bool,
 
-    displayed: Option<(SceneView, TexHandle)>,
+    displayed: Option<(SceneView, Preview)>,
 }
 
 impl Default for DatasetPanel {
@@ -166,11 +215,15 @@ impl Default for DatasetPanel {
             loading_start: None,
             displayed: None,
             loader: PreviewLoader::new(),
+            show_depth: false,
         }
     }
 }
 
-async fn load_preview(view: SceneView, ctx: egui::Context, preview_edge: u32) -> Option<TexHandle> {
+/// Load a view's RGB preview and, when the view carries a depth sidecar, its
+/// colormapped depth texture. Both ride the same loader so the panel only has
+/// to choose which to display.
+async fn load_preview(view: SceneView, ctx: egui::Context, preview_edge: u32) -> Option<Preview> {
     // The preview texture is capped to the panel size for GPU/memory reasons,
     // but report the resolution training actually uses (read from the header,
     // no full decode) so the panel doesn't claim a misleadingly small size.
@@ -194,10 +247,26 @@ async fn load_preview(view: SceneView, ctx: egui::Context, preview_edge: u32) ->
     let tex_key = view.image.path().to_string_lossy().into_owned();
     let egui_handle = ctx.load_texture(tex_key, color_img, TextureOptions::default());
 
-    Some(TexHandle {
-        handle: egui_handle,
-        has_alpha,
-        train_size,
+    let depth = if let Some(load) = view.depth.clone() {
+        match load.load().await {
+            Ok(data) => {
+                let img = depth_to_rgba(&data);
+                let key = load.path().to_string_lossy().into_owned();
+                Some(ctx.load_texture(key, img, TextureOptions::LINEAR))
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    Some(Preview {
+        tex: TexHandle {
+            handle: egui_handle,
+            has_alpha,
+            train_size,
+        },
+        depth,
     })
 }
 
@@ -215,9 +284,10 @@ impl DatasetPanel {
 
 impl AppPane for DatasetPanel {
     fn title(&self) -> egui::WidgetText {
-        let Some((view, tex)) = self.displayed.as_ref() else {
+        let Some((view, preview)) = self.displayed.as_ref() else {
             return "Dataset".into();
         };
+        let tex = &preview.tex;
 
         let img_name = view.image.img_name();
 
@@ -316,8 +386,8 @@ impl AppPane for DatasetPanel {
 
         // Hit → swap display. Miss → the loader has queued a decode; show the
         // stale image until it lands.
-        if let Some(tex) = self.loader.request(&target_view, ui.ctx()) {
-            self.displayed = Some((target_view.clone(), tex));
+        if let Some(preview) = self.loader.request(&target_view, ui.ctx()) {
+            self.displayed = Some((target_view.clone(), preview));
             self.loading_start = None;
 
             // Also load neighbours as those are often nearby / and makes the arrow
@@ -333,9 +403,10 @@ impl AppPane for DatasetPanel {
             self.loading_start = Some(web_time::Instant::now());
         }
 
-        let Some((view, tex)) = self.displayed.clone() else {
+        let Some((view, preview)) = self.displayed.clone() else {
             return;
         };
+        let tex = &preview.tex;
 
         // if training views have alpha, show a background checker. Masked images
         // should still use a black background.
@@ -368,20 +439,38 @@ impl AppPane for DatasetPanel {
         ui.painter()
             .rect_filled(full_rect, 0.0, Color32::from_gray(20));
 
-        if tex.has_alpha {
-            if view.image.alpha_mode() == AlphaMode::Masked {
-                draw_checkerboard(ui, rect, egui::Color32::DARK_RED);
-            } else {
-                draw_checkerboard(ui, rect, egui::Color32::WHITE);
-            }
-        }
+        // Depth overlay: only conf==2 pixels are opaque, so a checkerboard reads
+        // as "no supervised depth". Falls back to RGB if the view has no depth.
+        let depth_tex = if self.show_depth {
+            preview.depth.as_ref()
+        } else {
+            None
+        };
 
-        ui.painter().image(
-            tex.handle.id(),
-            rect,
-            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+        if let Some(depth_handle) = depth_tex {
+            draw_checkerboard(ui, rect, egui::Color32::WHITE);
+            ui.painter().image(
+                depth_handle.id(),
+                rect,
+                egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            if tex.has_alpha {
+                if view.image.alpha_mode() == AlphaMode::Masked {
+                    draw_checkerboard(ui, rect, egui::Color32::DARK_RED);
+                } else {
+                    draw_checkerboard(ui, rect, egui::Color32::WHITE);
+                }
+            }
+
+            ui.painter().image(
+                tex.handle.id(),
+                rect,
+                egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
 
         // Overlay only when what we're showing differs from what we want, and
         // the load has been in flight long enough to be worth surfacing.
@@ -409,6 +498,7 @@ impl AppPane for DatasetPanel {
     fn top_bar_right_ui(&mut self, ui: &mut egui::Ui, process: &UiProcess) {
         let pick_scene = selected_scene(self.view_type, &self.cur_dataset);
         let view_count = pick_scene.views.len();
+        let has_depth = pick_scene.views.iter().any(|v| v.depth.is_some());
 
         if view_count == 0 {
             return;
@@ -439,6 +529,17 @@ impl AppPane for DatasetPanel {
                         }
                     });
 
+                ui.add_space(6.0);
+            }
+
+            // RGB/Depth toggle, only when the scene carries depth sidecars.
+            if has_depth {
+                if ui.selectable_label(self.show_depth, "Depth").clicked() {
+                    self.show_depth = true;
+                }
+                if ui.selectable_label(!self.show_depth, "RGB").clicked() {
+                    self.show_depth = false;
+                }
                 ui.add_space(6.0);
             }
 

@@ -92,6 +92,55 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
 
+    /// Weight of the single-view depth <-> normal consistency loss.
+    #[arg(long, help_heading = "Geometry options", default_value = "0.05")]
+    pub depth_normal_weight: f32,
+
+    /// Weight of the metric depth supervision loss: L1 between the rendered
+    /// depth and the per-view `LiDAR` depth (when the dataset provides it),
+    /// confidence-weighted and sparse (at the `LiDAR` grid).
+    #[arg(long, help_heading = "Geometry options", default_value = "0.4")]
+    pub depth_loss_weight: f32,
+
+    /// Run the alpha-matching loss even when a view has no alpha channel, by
+    /// treating the view as fully opaque (alpha == 1). Pulls rendered alpha to 1
+    /// over the whole frame so the reconstruction is never see-through (the
+    /// transparency trap where a wall stays too transparent to receive depth
+    /// gradient). Uses `--match-alpha-weight`. No-op on views with real alpha.
+    #[arg(long, help_heading = "Geometry options", default_value = "false")]
+    pub force_alpha_loss: bool,
+
+    /// Weight of the depth-distortion loss (GOF `L_d`: squared pairwise error
+    /// over NDC-mapped depths, normalized per pixel): pulls each ray's splats
+    /// onto a single depth so the surface stops being a fuzzy shell.
+    #[arg(long, help_heading = "Geometry options", default_value = "100.0")]
+    pub distortion_weight: f32,
+
+    /// Master switch for the self-consistency geometry regularizers: the
+    /// iteration to turn them on at (depth-normal + depth-distortion, by their
+    /// weights above). Active from the start by default; pass a later iteration
+    /// to delay them.
+    #[arg(long, help_heading = "Geometry options", default_value = "0")]
+    pub geo_from_iter: Option<u32>,
+
+    /// `LiDAR` init cell size in metres: one oriented surfel per occupied cell
+    /// per surface-normal direction. Metric, so density is fixed regardless of
+    /// object size (a bigger object gets proportionally more seeds).
+    #[arg(long, help_heading = "Geometry options", default_value = "0.02")]
+    pub lidar_voxel_size: f32,
+
+    /// `ARKit` confidence floor (0/1/2) shared by the init seeds and the depth
+    /// loss: a return is used only at confidence >= this. Lower admits noisier
+    /// returns for more coverage.
+    #[arg(long, help_heading = "Geometry options", default_value = "2")]
+    pub lidar_min_conf: u8,
+
+    /// Trust `LiDAR` only out to this distance in metres, for both the init
+    /// seeds and the depth loss: returns past it are accurate but add unneeded
+    /// far geometry. No-return pixels (+inf) are excluded by the same gate.
+    #[arg(long, help_heading = "Geometry options", default_value = "2.0")]
+    pub lidar_max_depth: f32,
+
     /// Base background color (R,G,B) used during training.
     #[arg(
         long,
@@ -101,6 +150,10 @@ pub struct TrainConfig {
         num_args = 3
     )]
     pub background_color: Vec<f32>,
+
+    /// Mip-Splatting 3D-filter strength.
+    #[arg(long, help_heading = "Training options", default_value = "0.15")]
+    pub min_scale_factor: f32,
 
     /// Strength of random noise added to the background color each step.
     /// Noise is uniform in [-strength, +strength], clamped to [0, 1].
@@ -140,5 +193,11 @@ impl Default for TrainConfig {
 impl TrainConfig {
     pub fn total_iters(&self) -> u32 {
         self.total_train_iters + self.lod_levels * self.lod_refine_steps
+    }
+
+    /// Whether the self-consistency geometry regularizers (depth-normal,
+    /// distortion) are active at `iter` (gated by `geo_from_iter`).
+    pub fn geo_regs_on(&self, iter: u32) -> bool {
+        self.geo_from_iter.is_some_and(|from| iter >= from)
     }
 }

@@ -1,10 +1,15 @@
 use brush_async::{Actor, AsyncMap};
 use brush_process::slot::Slot;
 use brush_render::{
-    TextureMode, burn_glue::resolve_to_cube_float, camera::Camera, gaussian_splats::Splats,
+    burn_glue::resolve_to_cube_float,
+    camera::Camera,
+    gaussian_splats::{RenderOptions, Splats},
     render_splats,
 };
 use burn::tensor::Tensor;
+
+use crate::ui::app::ViewChannel;
+use crate::ui::geo_view::{visualize_alpha, visualize_geo};
 use egui::Rect;
 use glam::{UVec2, Vec3};
 
@@ -23,6 +28,7 @@ struct LastRenderState {
     camera: Camera,
     background: Vec3,
     splat_scale: Option<f32>,
+    view_channel: ViewChannel,
     img_size: UVec2,
 }
 
@@ -45,16 +51,44 @@ impl SplatBackbuffer {
         let pipe = AsyncMap::new(
             actor,
             async move |req: &RenderRequest| {
-                let (image, _) = render_splats(
-                    req.splats.get(req.state.frame).unwrap(),
-                    &req.state.camera,
-                    req.state.img_size,
-                    req.state.background,
-                    req.state.splat_scale,
-                    TextureMode::Packed,
-                )
-                .await;
-                image
+                let splats = req.splats.get(req.state.frame).unwrap();
+                match req.state.view_channel {
+                    ViewChannel::Rgb => {
+                        let (image, _) = render_splats(
+                            splats,
+                            &req.state.camera,
+                            req.state.img_size,
+                            RenderOptions::color().with_background(req.state.background),
+                            req.state.splat_scale,
+                        )
+                        .await;
+                        image
+                    }
+                    // The float render already carries alpha; no geometry
+                    // buffers needed for the coverage view.
+                    ViewChannel::Alpha => {
+                        let (image, _) = render_splats(
+                            splats,
+                            &req.state.camera,
+                            req.state.img_size,
+                            RenderOptions::float().with_background(req.state.background),
+                            req.state.splat_scale,
+                        )
+                        .await;
+                        visualize_alpha(image)
+                    }
+                    channel @ (ViewChannel::Depth { .. } | ViewChannel::Normal) => {
+                        let (geo, _) = render_splats(
+                            splats,
+                            &req.state.camera,
+                            req.state.img_size,
+                            RenderOptions::geometry().with_background(req.state.background),
+                            req.state.splat_scale,
+                        )
+                        .await;
+                        visualize_geo(geo, channel)
+                    }
+                }
             },
             |req: &RenderRequest| req.ctx.request_repaint(),
         );
@@ -71,6 +105,7 @@ impl SplatBackbuffer {
         frame: usize,
         background: Vec3,
         splat_scale: Option<f32>,
+        view_channel: ViewChannel,
         splats_dirty: bool,
     ) {
         // Calculate pixel size for rendering
@@ -86,6 +121,7 @@ impl SplatBackbuffer {
             camera: *camera,
             background,
             splat_scale,
+            view_channel,
             img_size,
         };
 

@@ -283,6 +283,16 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
         });
     }
 
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Depth-normal");
+            ui.add(Slider::new(
+                &mut args.train_config.depth_normal_weight,
+                0.0..=0.1,
+            ));
+        });
+    });
+
     ui.add_space(16.0);
 
     ui.heading("Dataset");

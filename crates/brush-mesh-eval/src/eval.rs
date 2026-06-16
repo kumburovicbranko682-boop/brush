@@ -1,0 +1,417 @@
+//! Mesh evaluation: render the extracted mesh at training-camera
+//! viewpoints with an in-process wgpu renderer
+//! ([`crate::render::MeshRenderer`]) and report PSNR vs the
+//! re-rendered splat appearance at each view, plus a labeled grid with
+//! one row per view and columns `GT | splat | mesh | depth`.
+//!
+//! All renders use a pinhole camera so the SBS panels are pixel-
+//! aligned. The mesh wgpu rasterizer is intrinsically pinhole (no
+//! distortion model in the shader); forcing the splat render to also be
+//! pinhole keeps the comparison honest and the SBS frames aligned
+//! (otherwise distorted-camera scenes show a visible "jump" between the
+//! panels).
+//!
+//! The mesh colour renderer is unlit (rendered RGB = barycentric
+//! vertex-color interpolation), so PSNR reflects mesh fidelity rather
+//! than any external shading model. The depth panel is per-view-z-
+//! normalised grayscale.
+
+use std::path::Path;
+
+use anyhow::Context;
+use brush_dataset::scene::SceneView;
+use brush_render::camera::Camera;
+use brush_render::gaussian_splats::RenderOptions;
+use brush_render::gaussian_splats::Splats;
+use brush_render::render_splats;
+use burn::tensor::s;
+use glam::{UVec2, Vec3};
+use image::{ImageBuffer, Rgb, RgbImage};
+
+pub struct ViewEval {
+    /// Enclosed background regions inside the mesh silhouette: cracks and
+    /// pinholes the coverage fraction cannot resolve.
+    pub holes: usize,
+    /// PSNR of mesh-render vs the splat render (at a pinhole camera).
+    pub psnr: f64,
+    /// Same, over mesh-covered pixels only: subject extraction leaves
+    /// out-of-region content unrendered by design, which the full-frame
+    /// PSNR counts as error.
+    pub psnr_masked: f64,
+    /// PSNR of mesh-render vs the GT image (at a pinhole camera).
+    pub psnr_vs_gt: f64,
+    /// PSNR of the splat render vs the GT image (splat appearance fidelity).
+    pub psnr_splat_vs_gt: f64,
+    pub coverage: f64,
+}
+
+pub async fn eval_psnr(
+    mesh: &brush_mesh::Mesh,
+    texture: Option<&brush_mesh::texture::Texture>,
+    train_views: &[SceneView],
+    splats: &Splats,
+    n: usize,
+    out_dir: &Path,
+) -> anyhow::Result<Vec<ViewEval>> {
+    std::fs::create_dir_all(out_dir).with_context(|| format!("mkdir {}", out_dir.display()))?;
+    let n = n.min(train_views.len());
+    let renderer = crate::render::MeshRenderer::new().context("initializing wgpu mesh renderer")?;
+    let mut results = Vec::with_capacity(n);
+    // One row per view: GT | splat | mesh | depth, assembled into a
+    // single labeled grid after the loop.
+    let mut rows: Vec<[RgbImage; 4]> = Vec::with_capacity(n);
+
+    let selection = select_views(train_views, n);
+    for &i in &selection {
+        let view = &train_views[i];
+        let (w, h) = view
+            .image
+            .output_dimensions()
+            .await
+            .context("read view dims")?;
+        let img_size = UVec2::new(w, h);
+
+        let pin_cam = view.camera.with_pinhole();
+
+        // GT: load the dataset image, RGB at native resolution.
+        let gt_img = load_gt_rgb(view).await?;
+
+        // Colour render: 2× supersample then bilinear-downsample to GT
+        // resolution. Effective 4× MSAA; removes per-face barycentric
+        // edge stairstepping. Depth is rendered at native resolution and
+        // *not* downsampled: downsampling blends valid foreground pixels
+        // with the (0,0,0) background, fading the panel into mush.
+        const SS: u32 = 2;
+        let (big_color, _) = renderer.render_with_depth(mesh, texture, &pin_cam, img_size * SS);
+        let rendered = image::imageops::resize(
+            &big_color,
+            img_size.x,
+            img_size.y,
+            image::imageops::FilterType::Triangle,
+        );
+        let (_, depth_raw) = renderer.render_with_depth(mesh, texture, &pin_cam, img_size);
+        let depth_img = crate::render::depth_to_color(&depth_raw, img_size.x, img_size.y);
+
+        let rendered_path = out_dir.join(format!("view_{i:04}.png"));
+        rendered
+            .save(&rendered_path)
+            .with_context(|| format!("saving mesh render to {}", rendered_path.display()))?;
+
+        let splat_img = render_splats_to_rgb(splats, &pin_cam, img_size).await?;
+        let splat_path = out_dir.join(format!("view_{i:04}_splat.png"));
+        splat_img
+            .save(&splat_path)
+            .with_context(|| format!("saving splat render to {}", splat_path.display()))?;
+
+        let device = splats.device();
+        let psnr_vs_splat = psnr(&rendered, &splat_img, &device).await;
+        let psnr_masked = psnr_masked(&rendered, &splat_img, &device).await;
+        let psnr_vs_gt = psnr(&rendered, &gt_img, &device).await;
+        let psnr_splat_vs_gt = psnr(&splat_img, &gt_img, &device).await;
+        let coverage = compute_coverage(&rendered);
+        let holes = count_enclosed_holes(&rendered);
+
+        log::info!(
+            "view[{i:04}]: PSNR(mesh vs splat)={psnr_vs_splat:.2} (masked {psnr_masked:.2}) \
+             PSNR(mesh vs GT)={psnr_vs_gt:.2} PSNR(splat vs GT)={psnr_splat_vs_gt:.2} \
+             coverage={:.1}% holes={holes}",
+            coverage * 100.0
+        );
+
+        rows.push([gt_img, splat_img, rendered, depth_img]);
+        results.push(ViewEval {
+            holes,
+            psnr: psnr_vs_splat,
+            psnr_masked,
+            psnr_vs_gt,
+            psnr_splat_vs_gt,
+            coverage,
+        });
+    }
+
+    if !rows.is_empty() {
+        let grid = assemble_grid(&rows, ["GT", "SPLAT", "MESH", "DEPTH"]);
+        let grid_path = out_dir.join("eval_grid.png");
+        grid.save(&grid_path)
+            .with_context(|| format!("saving grid to {}", grid_path.display()))?;
+        log::info!("wrote {} ({} view rows)", grid_path.display(), rows.len());
+    }
+
+    if !results.is_empty() {
+        let mean_psnr = results.iter().map(|r| r.psnr).sum::<f64>() / results.len() as f64;
+        let mean_masked = results.iter().map(|r| r.psnr_masked).sum::<f64>() / results.len() as f64;
+        let mean_gt = results.iter().map(|r| r.psnr_vs_gt).sum::<f64>() / results.len() as f64;
+        let mean_splat_gt =
+            results.iter().map(|r| r.psnr_splat_vs_gt).sum::<f64>() / results.len() as f64;
+        let mean_cov = results.iter().map(|r| r.coverage).sum::<f64>() / results.len() as f64;
+        let total_holes: usize = results.iter().map(|r| r.holes).sum();
+        log::info!(
+            "PSNR over {} views: mean_vs_splat={mean_psnr:.3} (masked {mean_masked:.3}) \
+             mean_vs_GT={mean_gt:.3} mean_splat_vs_GT={mean_splat_gt:.3} \
+             coverage={:.1}% holes={total_holes}",
+            results.len(),
+            mean_cov * 100.0
+        );
+    }
+
+    Ok(results)
+}
+
+/// Choose `n` view indices for the eval grid: rank cameras by distance to
+/// the camera-cloud centroid (approximates the scene center for inward
+/// captures), keep the farthest half, then spread those by frame order so
+/// the picks are both pulled-back and varied. Deterministic in the cameras
+/// only, so scores stay comparable across different meshes of one scene.
+fn select_views(views: &[SceneView], n: usize) -> Vec<usize> {
+    let len = views.len();
+    let n = n.min(len);
+    if n == 0 {
+        return Vec::new();
+    }
+    let centroid = views
+        .iter()
+        .fold(Vec3::ZERO, |acc, v| acc + v.camera.position)
+        / views.len().max(1) as f32;
+    let mut by_dist: Vec<usize> = (0..len).collect();
+    by_dist.sort_by(|&a, &b| {
+        let da = (views[a].camera.position - centroid).length();
+        let db = (views[b].camera.position - centroid).length();
+        db.partial_cmp(&da).expect("finite camera distances")
+    });
+    let mut pool: Vec<usize> = by_dist.into_iter().take((len / 2).max(n)).collect();
+    pool.sort_unstable();
+    (0..n).map(|k| pool[k * pool.len() / n]).collect()
+}
+
+async fn load_gt_rgb(view: &SceneView) -> anyhow::Result<RgbImage> {
+    let dyn_img = view.image.load().await.context("load GT image bytes")?;
+    Ok(dyn_img.into_rgb8())
+}
+
+fn img_tensor(img: &RgbImage, device: &burn::tensor::Device) -> burn::tensor::Tensor<3> {
+    let data: Vec<f32> = img.as_raw().iter().map(|&v| v as f32 / 255.0).collect();
+    burn::tensor::Tensor::from_data(
+        burn::tensor::TensorData::new(data, [img.height() as usize, img.width() as usize, 3]),
+        device,
+    )
+}
+
+/// RGB PSNR restricted to pixels the mesh actually rendered (non-black):
+/// out-of-region content is excluded by construction under subject
+/// extraction, so the full-frame PSNR conflates scope with quality.
+async fn psnr_masked(
+    mesh_img: &RgbImage,
+    target: &RgbImage,
+    _device: &burn::tensor::Device,
+) -> f64 {
+    let mut se = 0f64;
+    let mut n = 0u64;
+    for (m, t) in mesh_img.pixels().zip(target.pixels()) {
+        if m[0] != 0 || m[1] != 0 || m[2] != 0 {
+            for c in 0..3 {
+                let d = m[c] as f64 / 255.0 - t[c] as f64 / 255.0;
+                se += d * d;
+            }
+            n += 3;
+        }
+    }
+    if n == 0 {
+        return f64::NAN;
+    }
+    let mse = (se / n as f64).max(1e-10);
+    10.0 * (1.0 / mse).log10()
+}
+
+/// RGB PSNR between two equal-size images, computed on the GPU via
+/// [`brush_loss::psnr`].
+async fn psnr(a: &RgbImage, b: &RgbImage, device: &burn::tensor::Device) -> f64 {
+    debug_assert_eq!(
+        a.dimensions(),
+        b.dimensions(),
+        "PSNR needs equal-size images"
+    );
+    brush_loss::psnr(img_tensor(a, device), img_tensor(b, device))
+        .into_scalar_async::<f32>()
+        .await
+        .map_or(f64::NAN, f64::from)
+}
+
+/// Render the splats at `camera` to an 8-bit RGB image.
+async fn render_splats_to_rgb(
+    splats: &Splats,
+    camera: &Camera,
+    img_size: UVec2,
+) -> anyhow::Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+    let (img, _aux) = render_splats(splats.clone(), camera, img_size, RenderOptions::float(), None).await;
+    let rgb = img.slice(s![.., .., 0..3]);
+    let [h, w, _] = [rgb.dims()[0], rgb.dims()[1], rgb.dims()[2]];
+    let data = rgb
+        .into_data_async()
+        .await
+        .map_err(|e| anyhow::anyhow!("splat render readback: {e:?}"))?
+        .into_vec::<f32>()
+        .map_err(|e| anyhow::anyhow!("splat render f32 unpack: {e:?}"))?;
+    let mut out = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(w as u32, h as u32);
+    for y in 0..h {
+        for x in 0..w {
+            let base = (y * w + x) * 3;
+            let r = (data[base].clamp(0.0, 1.0) * 255.0).round() as u8;
+            let g = (data[base + 1].clamp(0.0, 1.0) * 255.0).round() as u8;
+            let b = (data[base + 2].clamp(0.0, 1.0) * 255.0).round() as u8;
+            out.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+        }
+    }
+    Ok(out)
+}
+
+/// Assemble the per-view rows into one grid: a labeled header band on
+/// top, then one row per view with four columns `GT | splat | mesh |
+/// depth`. Panels are placed top-left in a uniform cell sized to the
+/// largest panel; smaller panels are black-padded.
+fn assemble_grid(rows: &[[RgbImage; 4]], labels: [&str; 4]) -> RgbImage {
+    let cell_w = rows.iter().flatten().map(|p| p.width()).max().unwrap_or(1);
+    let cell_h = rows.iter().flatten().map(|p| p.height()).max().unwrap_or(1);
+
+    let scale = (cell_w / 120).max(2);
+    let header_h = GLYPH_H * scale + 4 * scale;
+    let total_w = cell_w * 4;
+    let total_h = header_h + cell_h * rows.len() as u32;
+    let mut out = ImageBuffer::from_pixel(total_w, total_h, Rgb([0u8, 0, 0]));
+
+    for (c, label) in labels.iter().enumerate() {
+        draw_label_centered(&mut out, label, c as u32 * cell_w, cell_w, header_h, scale);
+    }
+    for (r, row) in rows.iter().enumerate() {
+        let y = header_h + r as u32 * cell_h;
+        for (c, panel) in row.iter().enumerate() {
+            image::imageops::overlay(&mut out, panel, (c as u32 * cell_w) as i64, y as i64);
+        }
+    }
+    out
+}
+
+const GLYPH_W: u32 = 5;
+const GLYPH_H: u32 = 7;
+
+/// Draw `text` centered horizontally within `[x0, x0 + band_w)` and
+/// vertically within `[0, band_h)`, in white, scaled by `scale`.
+fn draw_label_centered(
+    out: &mut RgbImage,
+    text: &str,
+    x0: u32,
+    band_w: u32,
+    band_h: u32,
+    scale: u32,
+) {
+    let advance = (GLYPH_W + 1) * scale;
+    let text_w = text.chars().count() as u32 * advance - scale.min(advance);
+    let start_x = x0 + band_w.saturating_sub(text_w) / 2;
+    let start_y = band_h.saturating_sub(GLYPH_H * scale) / 2;
+    for (i, ch) in text.chars().enumerate() {
+        draw_glyph(out, ch, start_x + i as u32 * advance, start_y, scale);
+    }
+}
+
+fn draw_glyph(out: &mut RgbImage, ch: char, x: u32, y: u32, scale: u32) {
+    let Some(rows) = glyph(ch) else { return };
+    for (gy, bits) in rows.iter().enumerate() {
+        for gx in 0..GLYPH_W {
+            if bits & (1 << (GLYPH_W - 1 - gx)) != 0 {
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let px = x + gx * scale + sx;
+                        let py = y + gy as u32 * scale + sy;
+                        if px < out.width() && py < out.height() {
+                            out.put_pixel(px, py, Rgb([255, 255, 255]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 5×7 uppercase bitmap glyphs for the column labels (low 5 bits per
+/// row, MSB = leftmost pixel). Unknown chars render blank.
+fn glyph(ch: char) -> Option<[u8; 7]> {
+    Some(match ch {
+        'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
+        'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E],
+        'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        'M' => [0x11, 0x1B, 0x15, 0x11, 0x11, 0x11, 0x11],
+        'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        _ => return None,
+    })
+}
+
+/// Count enclosed background regions: black pixels not reachable from the
+/// image border. Coverage cannot resolve pinhole cracks (they are a
+/// vanishing pixel fraction); the region count tracks them directly.
+fn count_enclosed_holes(img: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> usize {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let bg: Vec<bool> = img
+        .pixels()
+        .map(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+        .collect();
+    let mut visited = vec![false; w * h];
+    let mut stack: Vec<usize> = Vec::new();
+    let flood = |stack: &mut Vec<usize>, visited: &mut Vec<bool>| {
+        while let Some(i) = stack.pop() {
+            if visited[i] || !bg[i] {
+                continue;
+            }
+            visited[i] = true;
+            let (x, y) = (i % w, i / w);
+            if x > 0 {
+                stack.push(i - 1);
+            }
+            if x + 1 < w {
+                stack.push(i + 1);
+            }
+            if y > 0 {
+                stack.push(i - w);
+            }
+            if y + 1 < h {
+                stack.push(i + w);
+            }
+        }
+    };
+    // Flood the border-connected background; what remains is enclosed.
+    for x in 0..w {
+        stack.push(x);
+        stack.push((h - 1) * w + x);
+    }
+    for y in 0..h {
+        stack.push(y * w);
+        stack.push(y * w + w - 1);
+    }
+    flood(&mut stack, &mut visited);
+    let mut holes = 0;
+    for start in 0..w * h {
+        if bg[start] && !visited[start] {
+            holes += 1;
+            stack.push(start);
+            flood(&mut stack, &mut visited);
+        }
+    }
+    holes
+}
+
+/// Coverage = fraction of pixels with non-background (non-(0,0,0))
+/// rendered colour. The wgpu renderer clears the colour target to
+/// transparent black, so this measures actual triangle coverage.
+fn compute_coverage(img: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> f64 {
+    let mut hit = 0u64;
+    let total = img.width() as u64 * img.height() as u64;
+    for p in img.pixels() {
+        if p[0] != 0 || p[1] != 0 || p[2] != 0 {
+            hit += 1;
+        }
+    }
+    hit as f64 / total as f64
+}

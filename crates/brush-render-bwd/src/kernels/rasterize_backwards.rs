@@ -7,6 +7,14 @@
 //! the full gradient for its splat in registers and emits a single atomic
 //! add per gradient component per batch.
 //!
+//! When `geo` is set the kernel additionally backprops the GOF geometry
+//! channels reconstructed per-pixel from `M = Σ_c⁻¹` and `Mμ = M·mean_c`: the
+//! surface normal `-norm(M·rp)` (alpha-blended) and the intersection depth
+//! `t* = (rp·Mμ)/(rpᵀ M rp)` (median + distortion). Their grads route to
+//! `v_M` (six unique entries) and `v_Mμ`, scattered into lanes 10..19, with a
+//! `dot_geo` term feeding the shared `v_alpha` (the normal + distortion
+//! couplings; the median depth is detached and does not couple).
+//!
 //! The atomic accumulation is parametrised by the [`AtomicAddF32`] trait:
 //! `HfAtomicAdd` (native `Atomic<f32>::fetch_add`) when the device
 //! supports it, `CasAtomicAdd` (`Atomic<u32>` + CAS over the bit pattern)
@@ -16,11 +24,12 @@ use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
+use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::helpers::{
     ALPHA_CUTOFF_MID, TILE_SIZE, TILE_WIDTH, alpha_cutoff_weight, alpha_cutoff_weight_deriv,
-    read_projected_splat,
+    dist_ndc, dist_ndc_deriv, is_finite_f32, pixel_ray, read_projected_geo, read_projected_splat,
 };
-use brush_render::kernels::types::{RasterizeUniforms, Splat, Sym2};
+use brush_render::kernels::types::{RasterizeUniforms, Splat, Sym2, Sym3, Vec3A};
 
 // SPLAT_BATCH = 32 = one Apple-Silicon SIMD group, so the per-iter
 // sync_cube collapses to a SIMD-lockstep no-op on hardware.
@@ -39,6 +48,17 @@ pub struct SplatGrad {
     pub rgb_b: f32,
     pub alpha: f32,
     pub refine: f32,
+    // Geometry grads (zero unless `geo`): six unique entries of v_M (the
+    // camera-space inverse covariance grad) then v_Mμ (M·mean_c grad).
+    pub m00: f32,
+    pub m01: f32,
+    pub m02: f32,
+    pub m11: f32,
+    pub m12: f32,
+    pub m22: f32,
+    pub mmu_x: f32,
+    pub mmu_y: f32,
+    pub mmu_z: f32,
 }
 
 #[cube]
@@ -54,6 +74,15 @@ fn zero_grad() -> SplatGrad {
         rgb_b: 0.0f32,
         alpha: 0.0f32,
         refine: 0.0f32,
+        m00: 0.0f32,
+        m01: 0.0f32,
+        m02: 0.0f32,
+        m11: 0.0f32,
+        m12: 0.0f32,
+        m22: 0.0f32,
+        mmu_x: 0.0f32,
+        mmu_y: 0.0f32,
+        mmu_z: 0.0f32,
     }
 }
 
@@ -98,25 +127,28 @@ impl AtomicAddF32 for CasAtomicAdd {
 }
 
 #[cube(launch)]
+#[allow(clippy::too_many_arguments)]
 pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     compact_gid_from_isect: &Tensor<u32>,
     tile_offsets: &Tensor<u32>,
     projected: &Tensor<f32>,
+    projected_geo: &Tensor<f32>,
     output: &Tensor<f32>,
     v_output: &Tensor<f32>,
     v_splats: &mut Tensor<Atomic<A::Storage>>,
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] geo: bool,
+    #[comptime] camera_model: CameraModel,
 ) {
     let (tile_id, tile_origin_x, tile_origin_y) = tile_origin(u.tile_bw);
-    // Only `pix_state` lives in shared memory — it gets read-modify-
-    // written each iteration (alpha decay) so threads need to see each
-    // other's writes. The other per-pixel inputs (`v_output`, the alpha
-    // pre-roll) are read-only post-init and L1-cached, so we re-derive
-    // them inline in the inner loop. Smaller shared footprint → more
-    // workgroup occupancy on Apple.
-    let mut pix_state = Shared::new_slice((TILE_SIZE * 4u32) as usize);
-    load_pixel_state(output, u, tile_origin_x, tile_origin_y, &mut pix_state);
+    // `pix_state` holds the per-pixel running color (and, when geo, normal
+    // + depth + distortion-moment) remainders plus transmittance. 4 floats
+    // for rgb+T; geo adds (Nx,Ny,Nz,depth) and the mapped-depth moments
+    // (S1, S2) the distortion weight-gradient replay walks back.
+    let ps = comptime![if geo { 10u32 } else { 4u32 }];
+    let mut pix_state = Shared::new_slice((TILE_SIZE * ps) as usize);
+    load_pixel_state(output, u, tile_origin_x, tile_origin_y, &mut pix_state, geo);
     let (range_lo, range_hi) = load_range(tile_offsets, tile_id);
     let num_splats_in_tile = range_hi - range_lo;
     let rounds = (num_splats_in_tile + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
@@ -130,8 +162,25 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             num_splats_in_tile,
             batch_idx,
         );
+        let (m_sym, mmu) = if comptime![geo] {
+            read_projected_geo(projected_geo, compact_gid)
+        } else {
+            (
+                Sym3 {
+                    c00: 0.0f32,
+                    c01: 0.0f32,
+                    c02: 0.0f32,
+                    c11: 0.0f32,
+                    c12: 0.0f32,
+                    c22: 0.0f32,
+                },
+                Vec3A::new(0.0f32, 0.0f32, 0.0f32),
+            )
+        };
         let grad = accumulate_grads_for_batch(
             splat,
+            m_sym,
+            mmu,
             splat_active,
             tile_origin_x,
             tile_origin_y,
@@ -142,9 +191,12 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             v_output,
             u,
             smooth_cutoff,
+            geo,
+            camera_model,
         );
         if splat_active {
-            let base = (compact_gid * 10u32) as usize;
+            let stride = comptime![if geo { 19u32 } else { 10u32 }];
+            let base = (compact_gid * stride) as usize;
             A::add(&v_splats[base], grad.xy_x);
             A::add(&v_splats[base + 1], grad.xy_y);
             A::add(&v_splats[base + 2], grad.conic_x);
@@ -155,6 +207,17 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             A::add(&v_splats[base + 7], grad.rgb_b);
             A::add(&v_splats[base + 8], grad.alpha);
             A::add(&v_splats[base + 9], grad.refine);
+            if comptime![geo] {
+                A::add(&v_splats[base + 10], grad.m00);
+                A::add(&v_splats[base + 11], grad.m01);
+                A::add(&v_splats[base + 12], grad.m02);
+                A::add(&v_splats[base + 13], grad.m11);
+                A::add(&v_splats[base + 14], grad.m12);
+                A::add(&v_splats[base + 15], grad.m22);
+                A::add(&v_splats[base + 16], grad.mmu_x);
+                A::add(&v_splats[base + 17], grad.mmu_y);
+                A::add(&v_splats[base + 18], grad.mmu_z);
+            }
         }
         batch_idx += 1u32;
     }
@@ -184,8 +247,9 @@ fn load_range(tile_offsets: &Tensor<u32>, tile_id: u32) -> (u32, u32) {
 }
 
 /// Seed `pix_state` with the post-rasterise RGB minus the bg pre-roll
-/// (so subtracting visited splats walks back to zero) and `T=1`. Pixels
-/// outside the image area get all-zero state — the inner loop's
+/// (so subtracting visited splats walks back to zero) and `T=1`. When geo,
+/// also seed the (Nx,Ny,Nz,D) remainder from the geometry channels (no bg).
+/// Pixels outside the image area get all-zero state; the inner loop's
 /// `state_w > 1.0e-4` guard then skips them.
 #[cube]
 fn load_pixel_state(
@@ -194,7 +258,10 @@ fn load_pixel_state(
     tile_origin_x: u32,
     tile_origin_y: u32,
     pix_state: &mut Shared<[f32]>,
+    #[comptime] geo: bool,
 ) {
+    let ps = comptime![if geo { 10u32 } else { 4u32 }];
+    let nchan = comptime![if geo { 11u32 } else { 4u32 }];
     let pixels_per_load = (TILE_SIZE + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
     let mut p = 0u32;
     while p < pixels_per_load {
@@ -203,10 +270,10 @@ fn load_pixel_state(
             let pix_x = tile_origin_x + pix_rank % TILE_WIDTH;
             let pix_y = tile_origin_y + pix_rank / TILE_WIDTH;
             let inside = pix_x < u.img_w && pix_y < u.img_h;
-            let s = (pix_rank * 4u32) as usize;
+            let s = (pix_rank * ps) as usize;
             if inside {
                 let pix_id = pix_x + pix_y * u.img_w;
-                let base = (pix_id * 4u32) as usize;
+                let base = (pix_id * nchan) as usize;
                 let final_r = output[base];
                 let final_g = output[base + 1];
                 let final_b = output[base + 2];
@@ -216,11 +283,31 @@ fn load_pixel_state(
                 pix_state[s + 1] = final_g - t_final * u.bg_g;
                 pix_state[s + 2] = final_b - t_final * u.bg_b;
                 pix_state[s + 3] = 1.0f32;
+                if comptime![geo] {
+                    // Alpha-blended remainders (normal + depth) plus the
+                    // distortion's mapped-depth moment remainders (S1, S2;
+                    // channels 9/10). The normalized distortion itself
+                    // (chan 8) is recomputed from these, not replayed.
+                    pix_state[s + 4] = output[base + 4];
+                    pix_state[s + 5] = output[base + 5];
+                    pix_state[s + 6] = output[base + 6];
+                    pix_state[s + 7] = output[base + 7];
+                    pix_state[s + 8] = output[base + 9];
+                    pix_state[s + 9] = output[base + 10];
+                }
             } else {
                 pix_state[s] = 0.0f32;
                 pix_state[s + 1] = 0.0f32;
                 pix_state[s + 2] = 0.0f32;
                 pix_state[s + 3] = 0.0f32;
+                if comptime![geo] {
+                    pix_state[s + 4] = 0.0f32;
+                    pix_state[s + 5] = 0.0f32;
+                    pix_state[s + 6] = 0.0f32;
+                    pix_state[s + 7] = 0.0f32;
+                    pix_state[s + 8] = 0.0f32;
+                    pix_state[s + 9] = 0.0f32;
+                }
             }
         }
         p += 1u32;
@@ -251,6 +338,8 @@ fn load_splat_for_batch(
 #[cube]
 fn accumulate_grads_for_batch(
     splat: Splat,
+    m_sym: Sym3,
+    mmu: Vec3A,
     splat_active: bool,
     tile_origin_x: u32,
     tile_origin_y: u32,
@@ -261,7 +350,11 @@ fn accumulate_grads_for_batch(
     v_output: &Tensor<f32>,
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] geo: bool,
+    #[comptime] camera_model: CameraModel,
 ) -> SplatGrad {
+    let ps = comptime![if geo { 10u32 } else { 4u32 }];
+    let nchan = comptime![if geo { 11u32 } else { 4u32 }];
     let conic = Sym2 {
         c00: splat.conic_x,
         c01: splat.conic_y,
@@ -282,7 +375,7 @@ fn accumulate_grads_for_batch(
 
         if active_iter {
             let pixel_rank = i - UNIT_POS;
-            let s = (pixel_rank * 4u32) as usize;
+            let s = (pixel_rank * ps) as usize;
             let state_x = pix_state[s];
             let state_y = pix_state[s + 1];
             let state_z = pix_state[s + 2];
@@ -320,7 +413,7 @@ fn accumulate_grads_for_batch(
                         // loads for ~5 KiB of shared memory back, which
                         // recovers an Apple-GPU occupancy slot.
                         let pix_id = pix_x + pix_y * u.img_w;
-                        let pix_base = (pix_id * 4u32) as usize;
+                        let pix_base = (pix_id * nchan) as usize;
                         let v_o_x = v_output[pix_base];
                         let v_o_y = v_output[pix_base + 1];
                         let v_o_z = v_output[pix_base + 2];
@@ -344,9 +437,147 @@ fn accumulate_grads_for_batch(
                         let new_remain_x = state_x - vis * clamped_r;
                         let new_remain_y = state_y - vis * clamped_g;
                         let new_remain_z = state_z - vis * clamped_b;
+
+                        // Geometry: the GOF per-pixel intersection. normal =
+                        // -norm(M·rp) and depth t* = (rp·Mμ)/(rpᵀ M rp) are
+                        // reconstructed from M + Mμ at this pixel's ray `rp`. The
+                        // normal blends with the rgb weights (value grad scatters,
+                        // `dot_geo` couples into v_alpha). The distortion (chan 8,
+                        // GOF: raw/(D0^2+eps) with raw = Sum_{i>j} w_i w_j
+                        // (m_i-m_j)^2 over NDC-mapped depths) contributes through
+                        // three routes: its depth dependence (m_k), its weight
+                        // dependence (w_k, same remainder pattern as the blended
+                        // channels), and the (1-T)^2 normalizer.
+                        let mut dot_geo = 0.0f32;
+                        if comptime![geo] {
+                            // Same in-kernel undistorted ray as the forward, so
+                            // the VJP is consistent.
+                            let rp = pixel_ray(
+                                pixel_coord_x,
+                                pixel_coord_y,
+                                u.pinhole.cx,
+                                u.pinhole.cy,
+                                u.pinhole.fx,
+                                u.pinhole.fy,
+                                camera_model,
+                            );
+                            let mrp = m_sym.mul_vec3(rp);
+                            let denom = rp.dot(mrp);
+                            let geo_ok = is_finite_f32(denom) && denom > 1e-12f32;
+                            let geo_mask = select(geo_ok, 1.0f32, 0.0f32);
+                            // Guard the divisions; masked out below when !geo_ok.
+                            let denom_s = select(geo_ok, denom, 1.0f32);
+                            let num = rp.dot(mmu);
+                            let t_pix = num / denom_s;
+                            let nlen = f32::max(mrp.length(), 1e-12f32);
+                            let nhat = mrp.scale(1.0f32 / nlen);
+                            let normal = nhat.scale(-1.0f32);
+
+                            let v_n_x = v_output[pix_base + 4] * geo_mask;
+                            let v_n_y = v_output[pix_base + 5] * geo_mask;
+                            let v_n_z = v_output[pix_base + 6] * geo_mask;
+                            let v_d = v_output[pix_base + 7] * geo_mask;
+                            let v_dist = v_output[pix_base + 8] * geo_mask;
+
+                            // Distortion pieces. D0 = Sum(w) = final_a, D1/D2 =
+                            // mapped-depth moments (channels 9/10), all full-pixel
+                            // sums; `vn` folds the detachedly-applied normalizer
+                            // into the upstream grad.
+                            let d0 = final_a;
+                            let d1 = output[pix_base + 9];
+                            let d2 = output[pix_base + 10];
+                            let norm = 1.0f32 / (d0 * d0 + 1e-7f32);
+                            let vn = v_dist * norm;
+                            let m = dist_ndc(t_pix);
+                            let dm_dt = dist_ndc_deriv(t_pix);
+
+                            // dL/dt = median depth value grad (weight 1, detached,
+                            // median splat only, no v_alpha coupling) + the
+                            // distortion depth route `draw/dm_k = 2 w_k (m_k D0 -
+                            // D1)` + the S1/S2 moment value grads (blend m and m^2),
+                            // all chained through the NDC mapping. t depends on
+                            // M (via denom) and Mμ (via num).
+                            let v_s1 = v_output[pix_base + 9] * geo_mask;
+                            let v_s2 = v_output[pix_base + 10] * geo_mask;
+                            let v_m = 2.0f32 * vis * (m * d0 - d1) * vn
+                                + vis * (v_s1 + 2.0f32 * m * v_s2);
+                            let is_median = state_w > 0.5f32 && next_t <= 0.5f32;
+                            let g_t = (select(is_median, v_d, 0.0f32) + v_m * dm_dt) * geo_mask;
+
+                            // t* = num/denom. ∂t/∂Mμ = rp/denom; ∂t/∂M =
+                            // -(num/denom^2)(rp ⊗ rp). v_M off-diagonals carry the
+                            // factor 2 (symmetric storage, both M_ij and M_ji).
+                            let inv_denom = geo_mask / denom_s;
+                            grad.mmu_x += g_t * rp.x() * inv_denom;
+                            grad.mmu_y += g_t * rp.y() * inv_denom;
+                            grad.mmu_z += g_t * rp.z() * inv_denom;
+                            let dt_coeff = -g_t * num * inv_denom * inv_denom;
+
+                            // normal = -M·rp / |M·rp|. v_g = -(I - n̂ n̂ᵀ)/|g| v_n,
+                            // then g = M·rp gives v_M += sym(outer(v_g, rp)). Value
+                            // grad of the blended normal is vis * v_n.
+                            let v_norm = Vec3A::new(vis * v_n_x, vis * v_n_y, vis * v_n_z);
+                            let v_norm_signed = v_norm.scale(-1.0f32);
+                            let v_g = v_norm_signed
+                                .sub(nhat.scale(nhat.dot(v_norm_signed)))
+                                .scale(1.0f32 / nlen);
+
+                            // Accumulate v_M (6 unique). Each entry sums the depth
+                            // route (dt_coeff·rp_i·rp_j) and the normal route
+                            // (v_g·rp); off-diagonals get the ×2 symmetric factor.
+                            grad.m00 += dt_coeff * rp.x() * rp.x() + v_g.x() * rp.x();
+                            grad.m11 += dt_coeff * rp.y() * rp.y() + v_g.y() * rp.y();
+                            grad.m22 += dt_coeff * rp.z() * rp.z() + v_g.z() * rp.z();
+                            grad.m01 += dt_coeff * 2.0f32 * rp.x() * rp.y()
+                                + v_g.x() * rp.y()
+                                + v_g.y() * rp.x();
+                            grad.m02 += dt_coeff * 2.0f32 * rp.x() * rp.z()
+                                + v_g.x() * rp.z()
+                                + v_g.z() * rp.x();
+                            grad.m12 += dt_coeff * 2.0f32 * rp.y() * rp.z()
+                                + v_g.y() * rp.z()
+                                + v_g.z() * rp.y();
+
+                            // v_alpha couplings, all in the shared remainder
+                            // pattern `(state_w*c_k - S_>=k) * ra`: the blended
+                            // normal, the distortion's weight route with c_k = G_k
+                            // = draw/dw_k = m^2 D0 + D2 - 2 m D1 (remainder
+                            // Sum_{i>=k} w_i G_i over the moment remainders), and the
+                            // normalizer route with c_k = 1, dL/dD0 = -2 D0 out norm.
+                            let state_nx = pix_state[s + 4];
+                            let state_ny = pix_state[s + 5];
+                            let state_nz = pix_state[s + 6];
+                            let state_d = pix_state[s + 7];
+                            let state_s1 = pix_state[s + 8];
+                            let state_s2 = pix_state[s + 9];
+                            let w_geq = state_w - (1.0f32 - final_a);
+                            let g_k = m * m * d0 + d2 - 2.0f32 * m * d1;
+                            let r_geq = d0 * state_s2 + d2 * w_geq - 2.0f32 * d1 * state_s1;
+                            let out_dist = output[pix_base + 8];
+                            let v_d0 = -2.0f32 * d0 * out_dist * vn;
+                            // No depth term here: GOF median depth does not
+                            // couple into v_alpha (detached selection).
+                            dot_geo = ((state_w * normal.x() - state_nx) * v_n_x
+                                + (state_w * normal.y() - state_ny) * v_n_y
+                                + (state_w * normal.z() - state_nz) * v_n_z
+                                + (state_w * m - state_s1) * v_s1
+                                + (state_w * m * m - state_s2) * v_s2
+                                + (state_w * g_k - r_geq) * vn
+                                + (state_w - w_geq) * v_d0)
+                                * ra;
+                            // Geo remainders only advance when this splat actually
+                            // contributed geo (geo_ok); otherwise leave untouched.
+                            pix_state[s + 4] = state_nx - vis * normal.x() * geo_mask;
+                            pix_state[s + 5] = state_ny - vis * normal.y() * geo_mask;
+                            pix_state[s + 6] = state_nz - vis * normal.z() * geo_mask;
+                            pix_state[s + 7] = state_d - vis * t_pix * geo_mask;
+                            pix_state[s + 8] = state_s1 - vis * m * geo_mask;
+                            pix_state[s + 9] = state_s2 - vis * m * m * geo_mask;
+                        }
+
                         // Chain through the cutoff. Hard step (production):
                         // w' = 0 and w == 1 in-branch, so the factor is 1.
-                        let v_alpha_eff = dot_rgb + v_o_w * ra;
+                        let v_alpha_eff = dot_rgb + dot_geo + v_o_w * ra;
                         let dw_dalpha = if comptime![smooth_cutoff] {
                             alpha_cutoff_weight_deriv(alpha)
                         } else {
@@ -366,11 +597,20 @@ fn accumulate_grads_for_batch(
                             grad.xy_x += vxy_x;
                             grad.xy_y += vxy_y;
                             grad.alpha += v_alpha * gaussian;
+
+                            // Densification trigger uses the *photometric*
+                            // positional gradient only. The geometry regularizers
+                            // (depth/normal) shape splats but must not drive
+                            // splitting, or they over-densify into a runaway.
+                            let v_alpha_col = (dot_rgb + v_o_w * ra) * (w_cut + alpha * dw_dalpha);
+                            let v_sigma_col = -alpha * v_alpha_col;
+                            let vxy_x_col = v_sigma_col * (conic.c00 * dx + conic.c01 * dy);
+                            let vxy_y_col = v_sigma_col * (conic.c01 * dx + conic.c11 * dy);
                             let img_size_x = u.img_w as f32;
                             let img_size_y = u.img_h as f32;
                             let len = f32::sqrt(
-                                vxy_x * img_size_x * vxy_x * img_size_x
-                                    + vxy_y * img_size_y * vxy_y * img_size_y,
+                                vxy_x_col * img_size_x * vxy_x_col * img_size_x
+                                    + vxy_y_col * img_size_y * vxy_y_col * img_size_y,
                             );
                             grad.refine += len / max(final_a, 1.0e-5f32);
                         }

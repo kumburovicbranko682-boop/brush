@@ -5,10 +5,8 @@ use burn::backend::Backend;
 use burn::backend::tensor::FloatTensor;
 use camera::Camera;
 use clap::ValueEnum;
-use glam::Vec3;
 
-use crate::gaussian_splats::SplatRenderMode;
-pub use crate::gaussian_splats::{Splats, TextureMode, render_splats};
+pub use crate::gaussian_splats::{Splats, render_splats};
 pub use crate::render_aux::{RenderAux, RenderAuxInner, RenderOutput};
 
 pub mod burn_glue;
@@ -27,6 +25,7 @@ mod tests;
 pub mod bounding_box;
 pub mod camera;
 pub mod gaussian_splats;
+pub mod geo;
 #[doc(hidden)]
 pub mod get_tile_offset;
 pub mod render;
@@ -63,18 +62,16 @@ pub trait SplatOps: Backend {
     /// Render gaussian splats to an image.
     ///
     /// Full forward pipeline: cull, depth sort, readback, project, rasterize.
-    /// `pass` picks forward-only vs. forward+backward-bookkeeping, and (only
-    /// for tests) toggles the C^1 smoothstep around the alpha cutoff.
-    #[allow(clippy::too_many_arguments)]
+    /// `options` bundles the background, pass (forward / backward / test-only
+    /// smooth-cutoff), render mode and geometry toggle; see
+    /// [`gaussian_splats::RenderOptions`] and its presets.
     fn render(
         camera: &Camera,
         img_size: glam::UVec2,
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
-        render_mode: SplatRenderMode,
-        background: Vec3,
-        pass: gaussian_splats::RasterPass,
+        options: gaussian_splats::RenderOptions,
     ) -> impl Future<Output = RenderOutput<Self>>;
 }
 

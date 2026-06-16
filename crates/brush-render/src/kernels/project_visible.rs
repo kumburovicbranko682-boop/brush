@@ -3,7 +3,7 @@
 
 use super::helpers::{
     calc_cov2d, compensate_cov2d, is_finite_f32, read_quat_unorm, read_scale, sigmoid,
-    world_to_cam, write_projected_splat,
+    splat_view_gof, world_to_cam, write_projected_geo, write_projected_splat,
 };
 use super::sh::{num_sh_coeffs, sh_coeffs_to_color};
 use super::types::{ProjectUniforms, Splat, Vec3A};
@@ -26,10 +26,12 @@ pub fn project_visible_kernel(
     raw_opacities: &Tensor<f32>,
     global_from_compact_gid: &Tensor<u32>,
     projected: &mut Tensor<f32>,
+    projected_geo: &mut Tensor<f32>,
     u: ProjectUniforms,
     #[comptime] mip_splatting: bool,
     #[comptime] sh_degree: u32,
     #[comptime] camera_model: CameraModel,
+    #[comptime] geo: bool,
 ) {
     let compact_gid = ABSOLUTE_POS as u32;
     if compact_gid >= u.num_visible {
@@ -46,6 +48,12 @@ pub fn project_visible_kernel(
     let quat = quat_unorm.normalize();
 
     let mean_c = world_to_cam(mean, u);
+
+    if comptime![geo] {
+        let (m, mmu) = splat_view_gof(scale, quat, mean_c, u.view_rotation());
+        write_projected_geo(projected_geo, compact_gid, m, mmu);
+    }
+
     let raw_cov = calc_cov2d(scale, quat, mean_c, u, camera_model);
     let (cov, filter_comp) = compensate_cov2d(raw_cov, mip_splatting);
     let opac = sigmoid(raw_opacities[global_gid as usize]) * filter_comp;

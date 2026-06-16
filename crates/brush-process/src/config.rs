@@ -49,6 +49,37 @@ pub struct ProcessConfig {
 
 #[derive(Parser, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub struct MeshConfig {
+    /// Extract and export a mesh (GOF-style) every this many steps, and always
+    /// on the last step. Unset = no mesh export. With --total-train-iters 0
+    /// this gives mesh-only extraction from the initial splats.
+    #[arg(
+        long,
+        help_heading = "Mesh options",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub export_mesh_every: Option<u32>,
+    /// Mesh-export region: the union of all camera frustums truncated at
+    /// this distance (scene units; metres on metric scenes).
+    #[arg(long, help_heading = "Mesh options", default_value = "2.5")]
+    pub export_mesh_dist: f32,
+    /// Central image crop fraction for the seed frustum: only geometry seen in
+    /// the central `frac` of some view is meshed. Crops away the distortion-
+    /// and coverage-poor image edges (where holes form). 1.0 = full image.
+    #[arg(long, help_heading = "Mesh options", default_value = "0.75")]
+    pub export_mesh_crop: f32,
+    /// Simplify the extracted mesh to roughly this many faces (quadric
+    /// collapse). 0 = no simplification: the raw marching-tets mesh.
+    #[arg(long, help_heading = "Mesh options", default_value = "500000")]
+    pub export_mesh_target_faces: u32,
+}
+
+#[derive(Parser, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+// merge_configs concatenates the args.txt args then the CLI args; without this,
+// any flag set in both makes clap error "cannot be used multiple times" and the
+// whole args.txt is dropped. Take the last (CLI) occurrence instead.
+#[command(args_override_self = true)]
 pub struct TrainStreamConfig {
     #[clap(flatten)]
     #[serde(flatten)]
@@ -62,6 +93,9 @@ pub struct TrainStreamConfig {
     #[clap(flatten)]
     #[serde(flatten)]
     pub process_config: ProcessConfig,
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub mesh_config: MeshConfig,
     #[clap(flatten)]
     #[serde(flatten)]
     pub rerun_config: brush_rerun::RerunConfig,

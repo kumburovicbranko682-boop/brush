@@ -4,29 +4,43 @@ use brush_async::Actor;
 use rand::{SeedableRng, seq::SliceRandom};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::scene::{Scene, SceneBatch, sample_to_packed_data, view_to_sample_image};
+use crate::scene::{DepthSample, Scene, SceneBatch, sample_to_packed_data, view_to_sample_image};
 
-/// Cache budget for packed scene batches. 6 GB on native; less on
-/// wasm since the whole heap is bounded by browser limits.
+/// Cache budget for prepared views. 6 GB on native; less on wasm since the
+/// whole heap is bounded by browser limits.
 #[cfg(not(target_family = "wasm"))]
 const CACHE_BUDGET_BYTES: usize = 6 * 1024 * 1024 * 1024;
 #[cfg(target_family = "wasm")]
 const CACHE_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// Shared cache of GPU-ready scene batches. Each slot holds at most one
-/// batch; once the running total passes `budget_bytes`, new batches bypass
-/// the cache and just get re-decoded + re-packed on every visit.
-///
-/// Caching the packed batch (instead of the decoded `DynamicImage`) skips
-/// the per-hit decode → premultiply → repack work: a cache hit is now a
-/// single copy of the already-packed `[H, W]` u32 buffer.
-struct BatchCache {
-    slots: Vec<Option<Arc<SceneBatch>>>,
+/// One fully-prepared view: packed GT image plus (when present) the `LiDAR`
+/// depth sample, ready to clone into a [`SceneBatch`].
+struct CachedView {
+    img_packed: burn::tensor::TensorData,
+    has_alpha: bool,
+    depth: Option<DepthSample>,
+}
+
+impl CachedView {
+    fn size_bytes(&self) -> usize {
+        let depth_bytes = self
+            .depth
+            .as_ref()
+            .map_or(0, |d| d.depth.as_bytes().len() + d.conf.as_bytes().len());
+        self.img_packed.as_bytes().len() + depth_bytes
+    }
+}
+
+/// Shared prepared-view cache. Each slot holds at most one view; once the
+/// running total passes `budget_bytes`, new views bypass the cache and just
+/// get re-prepared on every visit.
+struct ViewCache {
+    slots: Vec<Option<Arc<CachedView>>>,
     used_bytes: usize,
     budget_bytes: usize,
 }
 
-impl BatchCache {
+impl ViewCache {
     fn new(n_views: usize) -> Self {
         Self {
             slots: vec![None; n_views],
@@ -35,19 +49,17 @@ impl BatchCache {
         }
     }
 
-    fn get(&self, index: usize) -> Option<Arc<SceneBatch>> {
+    fn get(&self, index: usize) -> Option<Arc<CachedView>> {
         self.slots[index].clone()
     }
 
-    fn insert(&mut self, index: usize, batch: Arc<SceneBatch>) {
+    fn insert(&mut self, index: usize, view: Arc<CachedView>) {
         if self.slots[index].is_some() {
             return;
         }
-        // Track exact bytes: rounding to whole MB let sub-MB images slip in
-        // for free and bypass the budget entirely.
-        let size_bytes = batch.img_packed.as_bytes().len();
+        let size_bytes = view.size_bytes();
         if self.used_bytes + size_bytes < self.budget_bytes {
-            self.slots[index] = Some(batch);
+            self.slots[index] = Some(view);
             self.used_bytes += size_bytes;
         }
     }
@@ -78,7 +90,7 @@ impl SceneLoader {
         const TASKS_PER_ACTOR: usize = 2;
 
         let views = scene.views.clone();
-        let cache = Arc::new(Mutex::new(BatchCache::new(views.len())));
+        let cache = Arc::new(Mutex::new(ViewCache::new(views.len())));
 
         let mut task_idx: u64 = 0;
         let actors: Vec<Actor> = (0..n_actors)
@@ -112,9 +124,54 @@ impl SceneLoader {
     }
 }
 
+/// Load (or fetch from cache) a view's packed image + depth sample.
+async fn load_cached(
+    views: &Arc<Vec<crate::scene::SceneView>>,
+    cache: &Arc<Mutex<ViewCache>>,
+    index: usize,
+) -> Arc<CachedView> {
+    if let Some(cached) = cache.lock().await.get(index) {
+        return cached;
+    }
+    let view = &views[index];
+    let raw = view
+        .image
+        .load()
+        .await
+        .expect("Scene loader failed to load an image");
+    let sample = view_to_sample_image(raw, view.image.alpha_mode());
+    let (img_packed, has_alpha) = sample_to_packed_data(sample);
+    let depth = match &view.depth {
+        Some(d) => d
+            .load()
+            .await
+            // A view silently training without its depth supervision is
+            // worse than a loud sidecar problem.
+            .inspect_err(|e| log::warn!("Failed to load depth sidecar: {e}"))
+            .ok()
+            .map(|dd| DepthSample {
+                depth: burn::tensor::TensorData::new(dd.depth, [dd.height, dd.width, 1]),
+                // Raw ARKit confidence (0/1/2); the depth loss gates it against
+                // `--lidar-min-conf` so init and supervision share one floor.
+                conf: burn::tensor::TensorData::new(
+                    dd.conf.iter().map(|&c| c as f32).collect::<Vec<_>>(),
+                    [dd.height, dd.width, 1],
+                ),
+            }),
+        None => None,
+    };
+    let cached = Arc::new(CachedView {
+        img_packed,
+        has_alpha,
+        depth,
+    });
+    cache.lock().await.insert(index, cached.clone());
+    cached
+}
+
 async fn run_loader(
     views: Arc<Vec<crate::scene::SceneView>>,
-    cache: Arc<Mutex<BatchCache>>,
+    cache: Arc<Mutex<ViewCache>>,
     tx: mpsc::Sender<SceneBatch>,
     seed: u64,
 ) {
@@ -129,29 +186,16 @@ async fn run_loader(
         let index = shuffled.pop().expect("Need at least one view in dataset");
         let view = &views[index];
 
-        let batch = if let Some(batch) = cache.lock().await.get(index) {
-            batch
-        } else {
-            let raw = view
-                .image
-                .load()
-                .await
-                .expect("Scene loader failed to load an image");
-            let sample = view_to_sample_image(raw, view.image.alpha_mode());
-            let (img_packed, has_alpha) = sample_to_packed_data(sample);
-            let batch = Arc::new(SceneBatch {
-                img_packed,
-                has_alpha,
-                alpha_mode: view.image.alpha_mode(),
-                camera: view.camera,
-            });
-            cache.lock().await.insert(index, batch.clone());
-            batch
+        let cached = load_cached(&views, &cache, index).await;
+        let batch = SceneBatch {
+            img_packed: cached.img_packed.clone(),
+            has_alpha: cached.has_alpha,
+            alpha_mode: view.image.alpha_mode(),
+            camera: view.camera,
+            depth: cached.depth.clone(),
         };
 
-        // The channel takes an owned batch; clone the packed buffer out of
-        // the shared cache entry.
-        if tx.send(batch.as_ref().clone()).await.is_err() {
+        if tx.send(batch).await.is_err() {
             break;
         }
         brush_async::yield_now().await;

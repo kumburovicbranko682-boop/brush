@@ -11,7 +11,7 @@ use crate::{
 };
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, image_loss};
-use brush_render::gaussian_splats::Splats;
+use brush_render::gaussian_splats::{RenderOptions, Splats};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::render_splats;
 use burn::{
@@ -40,13 +40,6 @@ const MIN_OPACITY: f32 = 1.0 / 255.0;
 /// being recomputed and is held frozen (still applied), so splats settle
 /// against a fixed target instead of chasing a moving floor.
 const MIN_SCALE_FREEZE_FRAC: f32 = 0.9;
-
-/// Mip-Splatting 3D-filter strength (the paper's `s`): each splat gets a frozen
-/// per-splat world-space scale floor `f = sqrt(MIN_SCALE_FACTOR) · pixel size at
-/// the nearest observing camera`, i.e. a ~0.32px std-dev floor. Folded into
-/// scales/opacity at render (and baked at export), never optimized. Fundamental
-/// to well-behaved splats, so not a tunable.
-const MIN_SCALE_FACTOR: f32 = 0.1;
 
 type OptimizerType = OptimizerAdaptor<AdamScaled, Splats>;
 
@@ -118,8 +111,13 @@ pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
 impl SplatTrainer {
     #[allow(unused_variables)]
     pub fn new(config: &TrainConfig, device: &Device, bounds: BoundingBox) -> Self {
-        let decay =
-            (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
+        // With total_train_iters <= 1 (e.g. mesh-only extraction) the decay
+        // exponent 1/iters is undefined; keep a constant LR (gamma 1).
+        let decay = if config.total_train_iters <= 1 {
+            1.0
+        } else {
+            (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64)
+        };
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
 
         let ssim_enabled = config.ssim_weight > 0.0;
@@ -188,7 +186,21 @@ impl SplatTrainer {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
-            let diff_out = render_splats(render_input, &camera, img_size, background)
+            // Metric depth is ground-truth supervision: on from iteration 0
+            // when the batch carries LiDAR; the self-consistency regularizers
+            // are gated by `geo_from_iter`.
+            let geo_on = self.config.geo_regs_on(self.step_count);
+            let want_single = geo_on && self.config.depth_normal_weight > 0.0;
+            let want_depth = self.config.depth_loss_weight > 0.0 && batch.depth.is_some();
+            let want_distort = geo_on && self.config.distortion_weight > 0.0;
+            let want_geo = want_single || want_depth || want_distort;
+            let render_opts = if want_geo {
+                RenderOptions::geometry()
+            } else {
+                RenderOptions::float()
+            }
+            .with_background(background);
+            let diff_out = render_splats(render_input, &camera, img_size, render_opts, None)
                 .instrument(trace_span!("Forward"))
                 .await;
 
@@ -211,7 +223,14 @@ impl SplatTrainer {
             } else {
                 (1.0, 0.0)
             };
-            let do_alpha_match = has_alpha && !masked_alpha && self.config.match_alpha_weight > 0.0;
+            // Alpha matching needs an opaque/transparent target to pull rendered
+            // alpha toward. Real RGBA views supply it; `--force-alpha-loss`
+            // synthesises a fully-opaque target for views without alpha (the
+            // packed GT already stores alpha == 255 there), so the kernel's
+            // `|pred.a - gt.a|` channel pulls predicted alpha to 1.
+            let force_opaque = self.config.force_alpha_loss && !has_alpha;
+            let do_alpha_match = ((has_alpha && !masked_alpha) || force_opaque)
+                && self.config.match_alpha_weight > 0.0;
             // Only composite when there's a real alpha channel and a non-zero
             // bg to mix in; the kernel skips the per-pixel `(1-a)*bg` math
             // entirely when this is None.
@@ -251,6 +270,51 @@ impl SplatTrainer {
                         pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
                         gt_rgb_diff.unsqueeze_dim(0),
                     ) * self.config.lpips_loss_weight;
+            }
+
+            // Coverage alpha shared by the geometry losses below.
+            let geo_alpha = pred_image.clone().slice(s![.., .., 3..4]);
+
+            // Single-view depth-normal consistency (GOF/2DGS cosine), coverage-masked.
+            if let Some(geo) = diff_out.geo.clone().filter(|_| want_single) {
+                // True undistorted z=1 ray grid, a splat-independent constant.
+                // Built only when this loss is active and lifted as a no-grad
+                // constant so the FD normal unprojects against the real lens.
+                let ray_grid: Tensor<3> =
+                    Tensor::from_inner(brush_render::burn_glue::unproject_ray_grid(
+                        &device.clone().inner(),
+                        img_size,
+                        &camera,
+                    ));
+                let dn =
+                    brush_render::geo::depth_normal_consistency(geo, geo_alpha.clone(), ray_grid);
+                loss = loss + dn * self.config.depth_normal_weight;
+            }
+
+            // Depth-distortion (GOF's squared pairwise form): concentrate each ray's
+            // weight onto a single depth (accumulated in the rasterizer).
+            if let Some(geo) = diff_out.geo.clone().filter(|_| want_distort) {
+                let dist = brush_render::geo::depth_distortion(geo);
+                loss = loss + dist.mean() * self.config.distortion_weight;
+            }
+
+            // Metric depth supervision against the per-view LiDAR depth.
+            let depth_geo = diff_out.geo.clone().filter(|_| want_depth);
+            if let (Some(geo), Some(gt_depth)) = (depth_geo, &batch.depth) {
+                let dev_inner = device.clone().inner();
+                let gt_z: Tensor<3> =
+                    Tensor::from_inner(Tensor::from_data(gt_depth.depth.clone(), &dev_inner));
+                let gt_conf: Tensor<3> =
+                    Tensor::from_inner(Tensor::from_data(gt_depth.conf.clone(), &dev_inner));
+                let dl = brush_render::geo::depth_l1_loss(
+                    geo,
+                    geo_alpha.clone(),
+                    gt_z,
+                    gt_conf,
+                    self.config.lidar_min_conf,
+                    self.config.lidar_max_depth,
+                );
+                loss = loss + dl * self.config.depth_loss_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the
@@ -628,7 +692,9 @@ impl SplatTrainer {
             // `splats` is already on the inner backend here, so `means()` is too.
             // No-op when there are no view cameras (e.g. unit tests).
             let means = splats.means();
-            if let Some(f) = compute_min_scale(&means, &self.view_cams, MIN_SCALE_FACTOR) {
+            if let Some(f) =
+                compute_min_scale(&means, &self.view_cams, self.config.min_scale_factor)
+            {
                 splats = splats.with_min_scale(f);
             }
         }
@@ -792,7 +858,7 @@ impl SplatTrainer {
             );
         }
 
-        let train_t = (iter as f32 / self.config.total_train_iters as f32).clamp(0.0, 1.0);
+        let train_t = (iter as f32 / self.config.total_train_iters.max(1) as f32).clamp(0.0, 1.0);
         let t_shrink_strength = 1.0 - train_t;
         let minus_opac = self.config.opac_decay * t_shrink_strength;
 

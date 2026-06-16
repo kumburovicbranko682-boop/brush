@@ -8,7 +8,7 @@ use burn_cubecl::cubecl::prelude::*;
 
 use crate::kernels::camera_model::JacobianClampLimits;
 use crate::kernels::camera_model::pinhole::PinholeParams;
-pub use brush_cube::{Mat2x3, Mat3, PixelRect, Quat, Sym2, TileBbox, Vec3A};
+pub use brush_cube::{Mat2x3, Mat3, PixelRect, Quat, Sym2, Sym3, TileBbox, Vec3A};
 
 /// One projected splat as the kernel sees it. The on-device storage is
 /// a flat `Tensor<f32>` of `9 * num_visible` lanes (see
@@ -117,4 +117,9 @@ pub struct RasterizeUniforms {
     pub bg_r: f32,
     pub bg_g: f32,
     pub bg_b: f32,
+    // Works for any camera model: these are the pinhole intrinsics, and the
+    // per-pixel ray is undistorted in-kernel via `unproject_ray(camera_model)`,
+    // so all lens models are handled. The distorted normalized coord
+    // `d = ((px+0.5-cx)/fx, (py+0.5-cy)/fy)` is undistorted in-kernel.
+    pub pinhole: PinholeParams,
 }
