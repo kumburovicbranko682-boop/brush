@@ -4,6 +4,7 @@ use glam::{Affine3A, Vec3, vec3};
 use image::DynamicImage;
 use std::sync::Arc;
 
+pub use crate::load_depth::LoadDepth;
 pub use crate::load_image::LoadImage;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -17,6 +18,7 @@ pub enum ViewType {
 pub struct SceneView {
     pub image: LoadImage,
     pub camera: Camera,
+    pub depth: Option<LoadDepth>,
 }
 
 // Encapsulates a multi-view scene including cameras and the splats.
@@ -64,6 +66,7 @@ impl Scene {
             .map(|v| SceneView {
                 image: v.image.with_scale(scale),
                 camera: v.camera,
+                depth: v.depth,
             })
             .collect();
         Self::new(views)
@@ -139,6 +142,14 @@ pub fn sample_to_packed_data(sample: DynamicImage) -> (TensorData, bool) {
     (TensorData::new(packed, [h as usize, w as usize]), has_alpha)
 }
 
+/// Per-view metric depth supervision: `z`-depth (metres) + `ARKit` confidence,
+/// each `[H_d, W_d, 1]` f32 at the depth's native (low) resolution.
+#[derive(Clone, Debug)]
+pub struct DepthSample {
+    pub depth: TensorData,
+    pub conf: TensorData,
+}
+
 #[derive(Clone, Debug)]
 pub struct SceneBatch {
     /// `[H, W]` u32, each entry packs `[r g b a]` u8.
@@ -148,6 +159,7 @@ pub struct SceneBatch {
     pub has_alpha: bool,
     pub alpha_mode: AlphaMode,
     pub camera: Camera,
+    pub depth: Option<DepthSample>,
 }
 
 impl SceneBatch {

@@ -11,7 +11,6 @@
 //! verified by the finite-diff suite in `tests/finite_diff.rs`.
 
 use brush_render::{
-    TextureMode,
     camera::{Camera, focal_to_fov, fov_to_focal},
     gaussian_splats::{Splats, render_splats},
     kernels::camera_model::CameraModel::Pinhole,
@@ -125,9 +124,8 @@ async fn test_reference() -> anyhow::Result<()> {
             splats,
             &cam,
             glam::uvec2(w as u32, h as u32),
-            glam::Vec3::ZERO,
+            brush_render::gaussian_splats::RenderOptions::float(),
             None,
-            TextureMode::Float,
         )
         .await;
 

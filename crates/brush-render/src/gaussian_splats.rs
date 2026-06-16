@@ -47,11 +47,60 @@ impl RasterPass {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum TextureMode {
-    Packed,
-    #[default]
-    Float,
+/// Bundled per-render options for [`crate::SplatOps::render`]. Start from a
+/// preset ([`Self::color`] / [`Self::float`] / [`Self::geometry`]) and tweak
+/// with the `with_*` builders.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderOptions {
+    /// Mip vs default splat kernel.
+    pub render_mode: SplatRenderMode,
+    /// Solid background colour composited behind the splats.
+    pub background: Vec3,
+    /// Forward-only (packed u8 image) vs forward+backward (f32 image,
+    /// training/eval) vs the test-only smooth-cutoff backward pass.
+    pub pass: RasterPass,
+    /// Also produce the geometry buffers (normal + plane distance);
+    /// forces the f32 path.
+    pub geometry: bool,
+}
+
+impl RenderOptions {
+    /// u8 packed colour, forward-only (inference / viewer).
+    pub fn color() -> Self {
+        Self {
+            render_mode: SplatRenderMode::Default,
+            background: Vec3::ZERO,
+            pass: RasterPass::Forward,
+            geometry: false,
+        }
+    }
+    /// f32 colour with backward bookkeeping (training / eval).
+    pub fn float() -> Self {
+        Self {
+            pass: RasterPass::Backward,
+            ..Self::color()
+        }
+    }
+    /// f32 colour + GOF geometry buffers (backward pass).
+    pub fn geometry() -> Self {
+        Self {
+            pass: RasterPass::Backward,
+            geometry: true,
+            ..Self::color()
+        }
+    }
+    pub fn with_background(mut self, background: Vec3) -> Self {
+        self.background = background;
+        self
+    }
+    pub fn with_render_mode(mut self, render_mode: SplatRenderMode) -> Self {
+        self.render_mode = render_mode;
+        self
+    }
+    pub fn with_pass(mut self, pass: RasterPass) -> Self {
+        self.pass = pass;
+        self
+    }
 }
 
 /// Gaussian splat parameters.
@@ -361,15 +410,17 @@ impl Splats {
     }
 }
 
-/// Render splats on a non-differentiable device.
+/// Render splats on a non-differentiable device. `options.pass` picks the
+/// image format (`Forward` = packed u8, `Backward` = f32); geometry implies
+/// f32. `options.render_mode` is ignored (derived from the splats).
 pub async fn render_splats(
     splats: Splats,
     camera: &Camera,
     img_size: glam::UVec2,
-    background: Vec3,
+    options: RenderOptions,
     splat_scale: Option<f32>,
-    texture_mode: TextureMode,
 ) -> (Tensor<3>, RenderAux) {
+    let geo = options.geometry;
     splats.clone().validate_values().await;
 
     let sh_coeffs = splats.sh_coeffs.into_value();
@@ -398,7 +449,11 @@ pub async fn render_splats(
         SplatRenderMode::Default
     };
 
-    let use_float = matches!(texture_mode, TextureMode::Float);
+    // Geometry implies the f32 image: the geo channels only exist on the
+    // Backward path, whose remainder-walk backward needs unquantized rgba in
+    // the same buffer. A packed-u8 rgba + separate f32 geo image would need a
+    // second output tensor and kernel variant for a viewer-only path.
+    let use_float = geo || options.pass.bwd_info();
 
     // Float mode needs `Backward` (f32 image + per-splat bookkeeping); Packed
     // mode goes through the packed u8 path. Neither inference path uses the
@@ -417,25 +472,23 @@ pub async fn render_splats(
         transforms.into_dispatch(),
         sh_coeffs.into_dispatch(),
         raw_opacities.into_dispatch(),
-        render_mode,
-        background,
-        pass,
+        RenderOptions {
+            render_mode,
+            pass,
+            ..options
+        },
     )
     .await;
 
     output.clone().validate().await;
 
-    let img_size = output.aux.img_size;
-    let num_visible = output.aux.num_visible;
-    let num_intersections = output.aux.num_intersections;
-
     let aux = RenderAux {
-        num_visible,
-        num_intersections,
+        num_visible: output.aux.num_visible,
+        num_intersections: output.aux.num_intersections,
         visible: Tensor::from_dispatch(output.aux.visible),
         max_radius: Tensor::from_dispatch(output.aux.max_radius),
         tile_offsets: Tensor::from_dispatch(output.aux.tile_offsets),
-        img_size,
+        img_size: output.aux.img_size,
     };
 
     (Tensor::from_dispatch(output.out_img), aux)

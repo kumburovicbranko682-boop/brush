@@ -1,5 +1,6 @@
 use crate::kernels::camera_model::kannala_brandt_4::{
-    KannalaBrandt4Params, calculate_project_jacobian_kb4, calculate_projection_vjp_kb4, project_kb4,
+    KannalaBrandt4Params, calculate_project_jacobian_kb4, calculate_projection_vjp_kb4,
+    project_kb4, unproject_ray_kb4,
 };
 use crate::kernels::camera_model::pinhole::PinholeParams;
 use crate::kernels::types::ProjectUniforms;
@@ -58,6 +59,14 @@ fn thin_prism_polys(
     let dnv_dy = 2.0f32 * (p2 * x + (3.0f32 * p1 + sy1) * y);
 
     (nu, nv, dnu_dx, dnu_dy, dnv_dx, dnv_dy)
+}
+
+/// Undistorted z=1 ray from pinhole-normalized distorted coords `(dx, dy)`.
+/// Radial approximation: uses only the kb4 part, ignoring the thin-prism /
+/// tangential terms.
+#[cube]
+pub fn unproject_ray_tpf(dx: f32, dy: f32, #[comptime] params: ThinPrismFisheyeParams) -> Vec3A {
+    unproject_ray_kb4(dx, dy, params.kb4)
 }
 
 #[cube]

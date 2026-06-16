@@ -1,0 +1,38 @@
+[package]
+name = "brush-mesh"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+brush-render.path = "../brush-render"
+brush-cube.path = "../brush-cube"
+brush-dataset.path = "../brush-dataset"
+brush-prefix-sum.path = "../brush-prefix-sum"
+
+hashbrown.workspace = true
+rustc-hash = "1.1"
+
+burn.workspace = true
+burn-cubecl.workspace = true
+burn-wgpu.workspace = true
+glam.workspace = true
+rayon.workspace = true
+log.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt"] }
+image.workspace = true
+meshopt = "0.6.2"
+serde_json = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+brush-cube = { path = "../brush-cube", features = [] }
+brush-serde.path = "../brush-serde"
+rand.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+bytemuck.workspace = true
+
+[lints]
+workspace = true

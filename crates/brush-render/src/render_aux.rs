@@ -15,11 +15,17 @@ use crate::shaders::helpers::ProjectUniforms;
 /// re-wrap these primitives across the backend boundary automatically.
 #[derive(Debug, Clone, ExtensionType)]
 pub struct RenderOutput<B: Backend> {
+    /// `[H, W, 4]` (rgba) normally, or `[H, W, GEO_CHANNELS = 11]` (rgba +
+    /// view-space `Nx,Ny,Nz`, depth, distortion, two distortion moments)
+    /// when geometry was requested.
     pub out_img: FloatTensor<B>,
     #[extension_type]
     pub aux: RenderAuxInner<B>,
     // State needed by the backward pass; non-diff callers can ignore these.
     pub projected_splats: FloatTensor<B>,
+    /// `[num_visible, PROJECTED_GEO_LANES = 9]`, indexed by `compact_gid`.
+    /// A dummy `[1, 9]` tensor when geometry was not requested.
+    pub projected_geo: FloatTensor<B>,
     pub compact_gid_from_isect: IntTensor<B>,
     pub project_uniforms: ProjectUniforms,
     pub global_from_compact_gid: IntTensor<B>,

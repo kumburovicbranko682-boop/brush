@@ -4,13 +4,11 @@ use crate::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use crate::kernels::camera_model::radial_tangential_8::RadialTangential8Params;
 use crate::kernels::camera_model::thin_prism_fisheye::ThinPrismFisheyeParams;
 use crate::{
-    TextureMode,
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats, render_splats},
 };
 use assert_approx_eq::assert_approx_eq;
 use burn::tensor::{Distribution, Tensor};
-use glam::Vec3;
 use wasm_bindgen_test::wasm_bindgen_test;
 
 #[cfg(target_family = "wasm")]
@@ -47,8 +45,14 @@ async fn renders_at_all() {
         raw_opacity,
         SplatRenderMode::Default,
     );
-    let (output, _render_aux) =
-        render_splats(splats, &cam, img_size, Vec3::ZERO, None, TextureMode::Float).await;
+    let (output, _render_aux) = render_splats(
+        splats,
+        &cam,
+        img_size,
+        crate::gaussian_splats::RenderOptions::float(),
+        None,
+    )
+    .await;
 
     let rgb = output.clone().slice([0..32, 0..32, 0..3]);
     let alpha = output.slice([0..32, 0..32, 3..4]);
@@ -107,8 +111,14 @@ async fn renders_many_splats() {
         raw_opacity,
         SplatRenderMode::Default,
     );
-    let (output, aux) =
-        render_splats(splats, &cam, img_size, Vec3::ZERO, None, TextureMode::Float).await;
+    let (output, aux) = render_splats(
+        splats,
+        &cam,
+        img_size,
+        crate::gaussian_splats::RenderOptions::float(),
+        None,
+    )
+    .await;
 
     assert!(
         aux.num_visible > 0,
@@ -278,8 +288,14 @@ async fn render_scene(
     device: &burn::tensor::Device,
 ) -> Vec<f32> {
     let splats = scene_to_splats(scene, device);
-    let (output, _aux) =
-        render_splats(splats, cam, img_size, Vec3::ZERO, None, TextureMode::Float).await;
+    let (output, _aux) = render_splats(
+        splats,
+        cam,
+        img_size,
+        crate::gaussian_splats::RenderOptions::float(),
+        None,
+    )
+    .await;
     read_finite(output).await
 }
 
@@ -482,8 +498,14 @@ async fn renders_large_rotated_splats() {
         raw_opacity,
         SplatRenderMode::Default,
     );
-    let (output, _aux) =
-        render_splats(splats, &cam, img_size, Vec3::ZERO, None, TextureMode::Float).await;
+    let (output, _aux) = render_splats(
+        splats,
+        &cam,
+        img_size,
+        crate::gaussian_splats::RenderOptions::float(),
+        None,
+    )
+    .await;
 
     // Every tile must have nonzero alpha — a dropped tile shows up as all zeros.
     let alpha = output
@@ -545,8 +567,14 @@ async fn renders_many_large_splats_stress() {
         raw_opacity,
         SplatRenderMode::Default,
     );
-    let (output, _aux) =
-        render_splats(splats, &cam, img_size, Vec3::ZERO, None, TextureMode::Float).await;
+    let (output, _aux) = render_splats(
+        splats,
+        &cam,
+        img_size,
+        crate::gaussian_splats::RenderOptions::float(),
+        None,
+    )
+    .await;
 
     // Sanity: no NaNs, alpha everywhere.
     let data = output
@@ -615,7 +643,14 @@ async fn render_panics_loudly_on_nan_positions() {
         raw_opacity,
         SplatRenderMode::Default,
     );
-    let _ = render_splats(splats, &cam, img_size, Vec3::ZERO, None, TextureMode::Float).await;
+    let _ = render_splats(
+        splats,
+        &cam,
+        img_size,
+        crate::gaussian_splats::RenderOptions::float(),
+        None,
+    )
+    .await;
 }
 
 // Zero-splat Splats must not crash and must render every pixel as the
@@ -646,7 +681,14 @@ async fn zero_splats_renders_background() {
     assert_eq!(splats.num_splats(), 0);
 
     let bg = glam::vec3(0.7, 0.3, 0.1);
-    let (output, _aux) = render_splats(splats, &cam, img_size, bg, None, TextureMode::Float).await;
+    let (output, _aux) = render_splats(
+        splats,
+        &cam,
+        img_size,
+        crate::gaussian_splats::RenderOptions::float().with_background(bg),
+        None,
+    )
+    .await;
     let pixels = output
         .to_data_async()
         .await
@@ -821,8 +863,14 @@ async fn render_smoke_with_model(model: CameraModel) {
         raw_opacity,
         SplatRenderMode::Default,
     );
-    let (output, _aux) =
-        render_splats(splats, &cam, img_size, Vec3::ZERO, None, TextureMode::Float).await;
+    let (output, _aux) = render_splats(
+        splats,
+        &cam,
+        img_size,
+        crate::gaussian_splats::RenderOptions::float(),
+        None,
+    )
+    .await;
     read_finite(output).await;
 }
 

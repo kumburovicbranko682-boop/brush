@@ -20,11 +20,22 @@ use brush_render::{
         radial_tangential_8::RadialTangential8Params, thin_prism_fisheye::ThinPrismFisheyeParams,
     },
 };
-use brush_render_bwd::render_splats_with_pass;
+use brush_render_bwd::render_splats;
 
 /// Finite-diff tests need the C^1 cutoff so analytical and numerical
 /// agree at typical eps; production paths use the hard step.
 const PASS: RasterPass = RasterPass::BackwardSmoothCutoff;
+
+/// Smooth-cutoff backward options for the finite-diff checks.
+fn opts_for(background: Vec3) -> brush_render::gaussian_splats::RenderOptions {
+    brush_render::gaussian_splats::RenderOptions::float()
+        .with_background(background)
+        .with_pass(PASS)
+}
+
+fn geo_opts() -> brush_render::gaussian_splats::RenderOptions {
+    brush_render::gaussian_splats::RenderOptions::geometry().with_pass(PASS)
+}
 use burn::tensor::{Gradients, Tensor, s};
 use glam::Vec3;
 
@@ -105,7 +116,7 @@ async fn render_value(
         let splats = splats;
         let cam: &Camera = cam;
         let background = Vec3::ZERO;
-        async move { render_splats_with_pass(splats, cam, img_size, background, PASS).await }
+        async move { render_splats(splats, cam, img_size, opts_for(background), None).await }
     }
     .await;
     diff.img
@@ -126,7 +137,7 @@ async fn analytical_grads(
         let splats = splats.clone();
         let cam: &Camera = cam;
         let background = Vec3::ZERO;
-        async move { render_splats_with_pass(splats, cam, img_size, background, PASS).await }
+        async move { render_splats(splats, cam, img_size, opts_for(background), None).await }
     }
     .await;
     let grads = diff.img.mean().backward();
@@ -214,7 +225,7 @@ async fn finite_difference_gradient_broad() {
     let img_size = glam::uvec2(32, 32);
     let scene = base_scene();
 
-    let eps = 3e-4_f32;
+    let eps = 1e-3_f32;
     let rel_tol = 0.01_f32;
     let abs_tol = 5e-5_f32;
 
@@ -269,6 +280,214 @@ async fn finite_difference_gradient_broad() {
     assert!(
         failed.is_empty(),
         "finite-diff vs analytical mismatch:\n  {}",
+        failed.join("\n  "),
+    );
+}
+
+// Loss over the smooth geo channels (normal 0..3 + distortion 4..5), skipping
+// the depth channel 3: GOF median depth selects a single contributor at the 0.5
+// transmittance crossing, a detached choice whose gradient is intentionally
+// approximate and not finite-diff-checkable.
+fn geo_smooth_loss(geo: Tensor<3>) -> Tensor<1> {
+    let normal = geo.clone().slice(s![.., .., 0..3]);
+    let dist = geo.slice(s![.., .., 4..5]);
+    normal.mean() + dist.mean()
+}
+
+async fn render_value_geo(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+) -> f32 {
+    let splats = build_splats(scene, device);
+    let diff = brush_render_bwd::render_splats(splats, cam, img_size, geo_opts(), None).await;
+    geo_smooth_loss(diff.geo.expect("geo channels"))
+        .into_scalar_async::<f32>()
+        .await
+        .expect("loss readback")
+}
+
+async fn analytical_grads_geo(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+) -> (Splats, Gradients) {
+    let splats = build_splats(scene, device);
+    let diff =
+        brush_render_bwd::render_splats(splats.clone(), cam, img_size, geo_opts(), None).await;
+    let grads = geo_smooth_loss(diff.geo.expect("geo channels")).backward();
+    (splats, grads)
+}
+
+/// Geometry backward: perturb mean / rotation / scale and confirm the
+/// analytical grad of a loss over the GOF depth + covariance normal
+/// matches central differences.
+#[tokio::test]
+async fn finite_diff_geo() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let cam = std_cam();
+    let img_size = glam::uvec2(32, 32);
+    let scene = base_scene();
+
+    let eps = 3e-4_f32;
+    let rel_tol = 0.03_f32;
+    let abs_tol = 2e-4_f32;
+
+    let (splats, grads) = analytical_grads_geo(&scene, &cam, img_size, &device).await;
+
+    let cases: &[(Lane, usize, usize)] = &[
+        (Lane::Mean, 0, 0),
+        (Lane::Mean, 0, 2),
+        (Lane::Mean, 1, 1),
+        (Lane::Mean, 2, 0),
+        (Lane::Rot, 0, 1),
+        (Lane::Rot, 1, 2),
+        (Lane::Rot, 2, 3),
+        // Scale: the normal direction is scale-independent, but the blended
+        // N/D still depend on scale through the alpha-blend weights (conic).
+        (Lane::LogScale, 0, 0),
+        (Lane::LogScale, 0, 1),
+        (Lane::LogScale, 1, 2),
+        (Lane::LogScale, 2, 0),
+    ];
+    let mut failed: Vec<String> = Vec::new();
+    for (lane, splat, comp) in cases {
+        let mut s_plus = scene.clone();
+        perturb(&mut s_plus, *lane, *splat, *comp, eps);
+        let l_plus = render_value_geo(&s_plus, &cam, img_size, &device).await;
+
+        let mut s_minus = scene.clone();
+        perturb(&mut s_minus, *lane, *splat, *comp, -eps);
+        let l_minus = render_value_geo(&s_minus, &cam, img_size, &device).await;
+
+        let numerical = (l_plus - l_minus) / (2.0 * eps);
+        let an = analytical_at(&splats, &grads, *lane, *splat, *comp).await;
+
+        let abs_err = (numerical - an).abs();
+        let scale = numerical.abs().max(an.abs()).max(1e-8);
+        let tol = abs_tol + rel_tol * scale;
+        if abs_err > tol {
+            failed.push(format!(
+                "{}[{},{}]: numerical {numerical:.6} vs analytical {an:.6} \
+                 (|Δ|={abs_err:.3e} > tol {tol:.3e})",
+                lane_name(*lane),
+                splat,
+                comp,
+            ));
+        }
+    }
+
+    assert!(
+        failed.is_empty(),
+        "geo finite-diff vs analytical mismatch:\n  {}",
+        failed.join("\n  "),
+    );
+}
+
+/// Loss over just the distortion channel (GOF: normalized squared pairwise
+/// error over NDC-mapped depths), isolating its backward (depth route through
+/// the mapping + the weight and normalizer alpha couplings) from the
+/// normal/depth channels.
+async fn render_value_dist(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+) -> f32 {
+    let splats = build_splats(scene, device);
+    let diff = brush_render_bwd::render_splats(splats, cam, img_size, geo_opts(), None).await;
+    diff.geo
+        .expect("geo channels")
+        .slice(s![.., .., 4..5])
+        .mean()
+        .into_scalar_async::<f32>()
+        .await
+        .expect("loss readback")
+}
+
+async fn analytical_grads_dist(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+) -> (Splats, Gradients) {
+    let splats = build_splats(scene, device);
+    let diff =
+        brush_render_bwd::render_splats(splats.clone(), cam, img_size, geo_opts(), None).await;
+    let grads = diff
+        .geo
+        .expect("geo channels")
+        .slice(s![.., .., 4..5])
+        .mean()
+        .backward();
+    (splats, grads)
+}
+
+/// Depth-distortion backward: the channel depends on each splat's weight
+/// (opacity/scale/position via alpha), its mapped depth (position/rotation),
+/// and the (1-T)^2 normalizer, so perturb mean / scale /
+/// opacity / rotation and confirm the analytical grad matches central
+/// differences.
+#[tokio::test]
+async fn finite_diff_distortion() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let cam = std_cam();
+    let img_size = glam::uvec2(32, 32);
+    let scene = base_scene();
+
+    let eps = 3e-4_f32;
+    let rel_tol = 0.03_f32;
+    let abs_tol = 3e-4_f32;
+
+    let (splats, grads) = analytical_grads_dist(&scene, &cam, img_size, &device).await;
+
+    let cases: &[(Lane, usize, usize)] = &[
+        (Lane::Mean, 0, 0),
+        (Lane::Mean, 0, 2),
+        (Lane::Mean, 1, 1),
+        (Lane::Mean, 2, 2),
+        (Lane::LogScale, 0, 0),
+        (Lane::LogScale, 1, 1),
+        (Lane::LogScale, 2, 0),
+        (Lane::RawOpac, 0, 0),
+        (Lane::RawOpac, 2, 0),
+        (Lane::Rot, 0, 1),
+        (Lane::Rot, 1, 2),
+    ];
+    let mut failed: Vec<String> = Vec::new();
+    for (lane, splat, comp) in cases {
+        let mut s_plus = scene.clone();
+        perturb(&mut s_plus, *lane, *splat, *comp, eps);
+        let l_plus = render_value_dist(&s_plus, &cam, img_size, &device).await;
+
+        let mut s_minus = scene.clone();
+        perturb(&mut s_minus, *lane, *splat, *comp, -eps);
+        let l_minus = render_value_dist(&s_minus, &cam, img_size, &device).await;
+
+        let numerical = (l_plus - l_minus) / (2.0 * eps);
+        let an = analytical_at(&splats, &grads, *lane, *splat, *comp).await;
+
+        let abs_err = (numerical - an).abs();
+        let scale = numerical.abs().max(an.abs()).max(1e-8);
+        let tol = abs_tol + rel_tol * scale;
+        if abs_err > tol {
+            failed.push(format!(
+                "{}[{},{}]: numerical {numerical:.6} vs analytical {an:.6} \
+                 (|Δ|={abs_err:.3e} > tol {tol:.3e})",
+                lane_name(*lane),
+                splat,
+                comp,
+            ));
+        }
+    }
+
+    assert!(
+        failed.is_empty(),
+        "distortion finite-diff vs analytical mismatch:\n  {}",
         failed.join("\n  "),
     );
 }
@@ -381,7 +600,7 @@ async fn finite_diff_broad_mip_mode() {
             SplatRenderMode::Mip,
             device,
         );
-        let diff = render_splats_with_pass(splats, cam, img_size, Vec3::ZERO, PASS).await;
+        let diff = render_splats(splats, cam, img_size, opts_for(Vec3::ZERO), None).await;
         diff.img
             .mean()
             .into_scalar_async::<f32>()
@@ -404,7 +623,7 @@ async fn finite_diff_broad_mip_mode() {
             SplatRenderMode::Mip,
             device,
         );
-        let diff = render_splats_with_pass(splats.clone(), cam, img_size, Vec3::ZERO, PASS).await;
+        let diff = render_splats(splats.clone(), cam, img_size, opts_for(Vec3::ZERO), None).await;
         let g = diff.img.mean().backward();
         (splats, g)
     }
@@ -486,7 +705,7 @@ async fn finite_diff_weighted_loss() {
         device: &burn::tensor::Device,
     ) -> f32 {
         let splats = build_splats(scene, device);
-        let diff = render_splats_with_pass(splats, cam, img_size, Vec3::ZERO, PASS).await;
+        let diff = render_splats(splats, cam, img_size, opts_for(Vec3::ZERO), None).await;
         (diff.img * weights)
             .sum()
             .into_scalar_async::<f32>()
@@ -502,7 +721,7 @@ async fn finite_diff_weighted_loss() {
         device: &burn::tensor::Device,
     ) -> (Splats, Gradients) {
         let splats = build_splats(scene, device);
-        let diff = render_splats_with_pass(splats.clone(), cam, img_size, Vec3::ZERO, PASS).await;
+        let diff = render_splats(splats.clone(), cam, img_size, opts_for(Vec3::ZERO), None).await;
         let loss = (diff.img * weights).sum();
         (splats, loss.backward())
     }

@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::trace_span;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     author,
     version,

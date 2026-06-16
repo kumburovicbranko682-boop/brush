@@ -19,6 +19,14 @@ pub struct Camera {
 }
 
 impl Camera {
+    /// Copy with the camera model swapped to `Pinhole`.
+    pub fn with_pinhole(&self) -> Self {
+        Self {
+            camera_model: crate::kernels::camera_model::CameraModel::Pinhole,
+            ..*self
+        }
+    }
+
     pub fn new(
         position: glam::Vec3,
         rotation: glam::Quat,

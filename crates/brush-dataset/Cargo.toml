@@ -15,11 +15,13 @@ burn.workspace = true
 
 bytemuck.workspace = true
 thiserror = { workspace = true }
+anyhow.workspace = true
 image.workspace = true
 jpeg-decoder.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 glam.workspace = true
+hashbrown.workspace = true
 
 tracing.workspace = true
 log.workspace = true

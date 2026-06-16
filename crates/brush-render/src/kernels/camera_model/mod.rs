@@ -10,19 +10,20 @@ use crate::kernels::camera_model::CameraModel::{
     KannalaBrandt4, Pinhole, RadialTangential8, ThinPrismFisheye,
 };
 use crate::kernels::camera_model::kannala_brandt_4::{
-    KannalaBrandt4Params, calculate_project_jacobian_kb4, calculate_projection_vjp_kb4, project_kb4,
+    KannalaBrandt4Params, calculate_project_jacobian_kb4, calculate_projection_vjp_kb4,
+    project_kb4, unproject_ray_kb4,
 };
 use crate::kernels::camera_model::pinhole::{
     PinholeParams, calculate_project_jacobian_pinhole, calculate_projection_vjp_pinhole,
-    project_pinhole,
+    project_pinhole, unproject_ray_pinhole,
 };
 use crate::kernels::camera_model::radial_tangential_8::{
     RadialTangential8Params, calculate_project_jacobian_rt8, calculate_projection_vjp_rt8,
-    project_rt8,
+    project_rt8, unproject_ray_rt8,
 };
 use crate::kernels::camera_model::thin_prism_fisheye::{
     ThinPrismFisheyeParams, calculate_project_jacobian_tpf, calculate_projection_vjp_tpf,
-    project_tpf,
+    project_tpf, unproject_ray_tpf,
 };
 use crate::kernels::types::ProjectUniforms;
 use brush_cube::{Mat2x3, Sym2, Sym3, Vec2, Vec3A};
@@ -56,6 +57,19 @@ pub fn project(
         KannalaBrandt4(params) => project_kb4(point, pinhole_params, params),
         RadialTangential8(params) => project_rt8(point, pinhole_params, params),
         ThinPrismFisheye(params) => project_tpf(point, pinhole_params, params),
+    }
+}
+
+/// Undistorted z=1 camera ray for a pixel, from the pinhole-normalized
+/// distorted coord `d = ((px+0.5-cx)/fx, (py+0.5-cy)/fy)`. Inverts the lens
+/// model so the GOF geometry depth/normal unproject against the true ray.
+#[cube]
+pub fn unproject_ray(dx: f32, dy: f32, #[comptime] camera_model: CameraModel) -> Vec3A {
+    match camera_model {
+        Pinhole => unproject_ray_pinhole(dx, dy),
+        KannalaBrandt4(params) => unproject_ray_kb4(dx, dy, params),
+        RadialTangential8(params) => unproject_ray_rt8(dx, dy, params),
+        ThinPrismFisheye(params) => unproject_ray_tpf(dx, dy, params),
     }
 }
 

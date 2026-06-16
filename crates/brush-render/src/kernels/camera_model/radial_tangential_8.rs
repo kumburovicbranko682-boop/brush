@@ -20,6 +20,43 @@ pub struct RadialTangential8Params {
     pub p2: f32,
 }
 
+/// Undistorted z=1 ray from pinhole-normalized distorted coords `(dx, dy)`.
+/// Inverts the radial polynomial only (tangential p1,p2 ignored, matching the
+/// CPU `undistort_norm`): fixed-point `r_u = r_d / radial(r_u)`.
+#[cube]
+pub fn unproject_ray_rt8(dx: f32, dy: f32, #[comptime] params: RadialTangential8Params) -> Vec3A {
+    let RadialTangential8Params {
+        k1,
+        k2,
+        k3,
+        k4,
+        k5,
+        k6,
+        ..
+    } = params;
+
+    let r_d = f32::sqrt(dx * dx + dy * dy);
+    let mut scale = 1.0f32;
+    if r_d >= 1e-12f32 {
+        let mut r_u = r_d;
+        let mut iter = 0u32;
+        while iter < 20u32 {
+            let r2 = r_u * r_u;
+            let r4 = r2 * r2;
+            let r6 = r4 * r2;
+            let num = 1.0f32 + k1 * r2 + k2 * r4 + k3 * r6;
+            let den = 1.0f32 + k4 * r2 + k5 * r4 + k6 * r6;
+            let radial = num / den;
+            // Compound assign: a plain `r_u = r_d / radial` can fail to update
+            // the outer var inside a `#[cube]` loop.
+            r_u += (r_d / radial) - r_u;
+            iter += 1u32;
+        }
+        scale += (r_u / r_d) - 1.0f32;
+    }
+    Vec3A::new(dx * scale, dy * scale, 1.0f32)
+}
+
 #[cube]
 pub fn project_rt8(
     point: Vec3A,
