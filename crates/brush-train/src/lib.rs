@@ -13,4 +13,4 @@ mod stats;
 
 mod splat_init;
 
-pub use splat_init::{RandomSplatsConfig, create_random_splats, to_init_splats};
+pub use splat_init::to_init_splats;

@@ -120,7 +120,7 @@ pub struct TrainConfig {
     /// iteration to turn them on at (depth-normal + depth-distortion, by their
     /// weights above). Active from the start by default; pass a later iteration
     /// to delay them.
-    #[arg(long, help_heading = "Geometry options", default_value = "0")]
+    #[arg(long, help_heading = "Geometry options")]
     pub geo_from_iter: Option<u32>,
 
     /// `LiDAR` init cell size in metres: one oriented surfel per occupied cell

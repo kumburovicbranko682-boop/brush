@@ -4,6 +4,7 @@ pub mod config;
 pub mod lidar_init;
 pub mod load_depth;
 pub mod load_image;
+pub mod random_init;
 pub mod scene;
 pub mod scene_loader;
 

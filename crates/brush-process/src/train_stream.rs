@@ -10,7 +10,6 @@ use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
-    RandomSplatsConfig, create_random_splats,
     eval::eval_stats,
     lod::{compute_pup_scores, decimate_to_count},
     msg::RefineStats,
@@ -21,8 +20,11 @@ use brush_vfs::BrushVfs;
 use burn::module::AutodiffModule;
 use burn_cubecl::cubecl::Runtime;
 use burn_wgpu::{AutoCompiler, WgpuRuntime};
-use rand::SeedableRng;
 use std::{path::PathBuf, sync::Arc};
+
+/// Splat count for the camera-ray random init when no point cloud / depth seed
+/// is available.
+const RANDOM_INIT_COUNT: usize = 10000;
 
 #[allow(unused)]
 use std::path::Path;
@@ -57,7 +59,6 @@ pub(crate) async fn train_stream(
     // burn-dispatch's `from_inner` checkpointing bug.
     let device: burn::tensor::Device = wgpu_device.clone().into();
     device.seed(process_config.seed);
-    let mut rng = rand::rngs::StdRng::from_seed([process_config.seed as u8; 32]);
 
     log::info!("Loading dataset");
     let load_result = load_dataset(vfs.clone(), &train_stream_config.load_config)
@@ -154,19 +155,18 @@ pub(crate) async fn train_stream(
         let splats = to_init_splats(data.subsample(max_splats), render_mode, &device);
         (None, splats)
     } else {
-        log::info!("Starting with random splat config.");
-        let cameras: Vec<_> = dataset.train.views.iter().map(|v| v.camera).collect();
-        let config = RandomSplatsConfig::new();
+        log::info!("Starting with random init from camera rays.");
         let scene_scale = train_stream_config.train_config.random_init_scene_scale;
         let render_mode = cfg_render_mode.unwrap_or(SplatRenderMode::Default);
-        let splats = create_random_splats(
-            &config,
-            &cameras,
+        let data = brush_dataset::random_init::random_init_splats(
+            dataset.train.views.as_slice(),
+            RANDOM_INIT_COUNT,
             scene_scale,
-            &mut rng,
-            render_mode,
-            &device,
-        );
+            process_config.seed,
+        )
+        .await?;
+        log::info!("Initializing {} random splats.", data.num_splats());
+        let splats = to_init_splats(data.subsample(max_splats), render_mode, &device);
         (None, splats)
     };
 
