@@ -244,18 +244,6 @@ pub(crate) async fn train_stream(
         .unwrap_or_else(|| PathBuf::from("."));
 
     let export_path = base_path.join(&export_path_str);
-    // Reproducibility: persist the fully resolved run configuration next to
-    // the exports.
-    {
-        let args_path = export_path.join("geo.args.txt");
-        if let Ok(json) = serde_json::to_string_pretty(&train_stream_config) {
-            let _ = std::fs::create_dir_all(&export_path);
-            if let Err(e) = std::fs::write(&args_path, json) {
-                log::warn!("Could not write {}: {e}", args_path.display());
-            }
-        }
-    }
-    // Normalize path components
     let export_path: PathBuf = export_path.components().collect();
     let sh_degree = init_splats.sh_degree();
 
